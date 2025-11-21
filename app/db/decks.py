@@ -41,10 +41,10 @@ def load_deck_card_defs(deck_id: str) -> List[Dict]:
 
     cards_by_code = {c["card_code"]: c for c in card_rows}
 
-    # 3) load card_types mapping: id -> code ('monster', 'spell', etc.)
-    ct_resp = supabase.table("card_types").select("id, code").execute()
+    # 3) load card_types mapping: card_type_id -> code ('monster', 'spell', etc.)
+    ct_resp = supabase.table("card_types").select("card_type_id, code").execute()
     type_rows = ct_resp.data or []
-    type_map = {row["id"]: row["code"] for row in type_rows}
+    type_map = {row["card_type_id"]: row["code"] for row in type_rows}
 
     deck_defs: List[Dict] = []
 

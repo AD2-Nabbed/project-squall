@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict
 import uuid
 
 
@@ -30,8 +30,9 @@ class MatchStatus(str, Enum):
 class CardInstance:
     """
     A single copy of a card that exists in a match.
-    This is the runtime version of a row from `cards` + its current state.
+    This is the runtime version of a row from `cards` + current battle state.
     """
+
     instance_id: str
     card_code: str
     name: str
@@ -46,10 +47,11 @@ class CardInstance:
     face_down: bool = True
     can_attack: bool = False
 
-    # Statuses like "barrier", "frozen", "hardened", etc.
-    statuses: Set[str] = field(default_factory=set)
+    # Statuses like "barrier", "frozen", etc.
+    # MUST be JSON serializable → list instead of set
+    statuses: List[str] = field(default_factory=list)
 
-    # For future: reference to raw effect data (effect_tags, effect_params)
+    # Effects from DB
     effect_tags: List[str] = field(default_factory=list)
     effect_params: dict = field(default_factory=dict)
 
@@ -66,9 +68,7 @@ class CardInstance:
         face_down: bool = True,
     ) -> "CardInstance":
         """
-        Helper for when we pull card data from Supabase and need
-        to create a runtime instance.
-        `card_def` is expected to be a dict from the `cards` table.
+        Create a runtime card instance from a DB definition.
         """
         instance_id = str(uuid.uuid4())
         card_type = CardType(card_def["card_type"])
@@ -95,8 +95,7 @@ class CardInstance:
 @dataclass
 class PlayerState:
     """
-    Full runtime state for a single player in a match.
-    This is the thing the GameState holds for player 1 and 2.
+    Full runtime state for a player during a match.
     """
     player_index: int  # 1 or 2
     name: str
@@ -126,22 +125,22 @@ class PlayerState:
 class GameState:
     """
     Complete match state.
-    This is what we will eventually serialize into matches.serialized_game_state.
+    This gets serialized into matches.serialized_game_state.
     """
     match_id: str
     turn: int = 1
-    current_player: int = 1  # 1 or 2
+    current_player: int = 1
     phase: Phase = Phase.START
     status: MatchStatus = MatchStatus.IN_PROGRESS
     winner: Optional[int] = None  # 1, 2, or None
 
     players: Dict[int, PlayerState] = field(default_factory=dict)
 
-    # Later: stack, trigger queue, event log, RNG seed, etc.
+    # Action/event log
     log: List[dict] = field(default_factory=list)
 
     def get_player(self, index: int) -> PlayerState:
         return self.players[index]
 
     def get_opponent(self, index: int) -> PlayerState:
-        return self.players[1 if index == 2 else 2]
+        return self.players[2 if index == 1 else 1]

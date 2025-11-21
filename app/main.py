@@ -23,74 +23,15 @@ class BattleStartRequest(BaseModel):
     npc_id: str | None = None  # optional: force a specific NPC later
 
 
-
-def _example_deck(card_prefix: str) -> list[dict[str, Any]]:
-    """
-    Temporary helper: build a small fake deck list.
-    Later this will come from Supabase (decks + deck_cards + cards).
-    """
-    return [
-        {
-            "card_code": f"{card_prefix}-MON-001",
-            "name": f"{card_prefix} Imp",
-            "card_type": "monster",
-            "stars": 1,
-            "atk": 50,
-            "hp": 50,
-            "element_id": None,
-            "effect_tags": [],
-            "effect_params": {},
-        },
-        {
-            "card_code": f"{card_prefix}-MON-002",
-            "name": f"{card_prefix} Soldier",
-            "card_type": "monster",
-            "stars": 2,
-            "atk": 100,
-            "hp": 100,
-            "element_id": None,
-            "effect_tags": [],
-            "effect_params": {},
-        },
-        {
-            "card_code": f"{card_prefix}-MON-003",
-            "name": f"{card_prefix} Guardian",
-            "card_type": "monster",
-            "stars": 3,
-            "atk": 150,
-            "hp": 150,
-            "element_id": None,
-            "effect_tags": [],
-            "effect_params": {},
-        },
-        {
-            "card_code": f"{card_prefix}-MON-004",
-            "name": f"{card_prefix} Bruiser",
-            "card_type": "monster",
-            "stars": 2,
-            "atk": 150,
-            "hp": 50,
-            "element_id": None,
-            "effect_tags": [],
-            "effect_params": {},
-        },
-        {
-            "card_code": f"{card_prefix}-MON-005",
-            "name": f"{card_prefix} Wall",
-            "card_type": "monster",
-            "stars": 2,
-            "atk": 50,
-            "hp": 150,
-            "element_id": None,
-            "effect_tags": [],
-            "effect_params": {},
-        },
-    ]
-
-
 @app.get("/health")
 def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
+@app.get("/test/supabase")
+def test_supabase():
+    result = supabase.table("players").select("*").limit(1).execute()
+    return {"ok": True, "data": result.data}
+
 
 
 @app.post("/battle/start")
