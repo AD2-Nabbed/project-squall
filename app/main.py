@@ -18,17 +18,15 @@ app = FastAPI(
     version="0.1.0",
 )
 
-
 # -------------------------------------------------------------------
 # Helpers to serialize GameState -> plain JSON dict (for Supabase)
 # -------------------------------------------------------------------
+
 
 def card_instance_to_dict(ci: CardInstance) -> Dict[str, Any]:
     """
     Convert a CardInstance dataclass into a JSON-serializable dict.
     """
-    # statuses was originally a set; you’ve now made it a list,
-    # but this keeps us safe either way.
     statuses = ci.statuses
     if isinstance(statuses, set):
         statuses = list(statuses)
@@ -94,21 +92,41 @@ def game_state_to_dict(gs: GameState) -> Dict[str, Any]:
 # Request models
 # -------------------------------------------------------------------
 
+
 class BattleStartRequest(BaseModel):
     player_id: str        # players.id (uuid)
     deck_id: str          # decks.id chosen by the player
     npc_id: Optional[str] = None  # optional: force a specific NPC later
 
 
+class PlayMonsterPayload(BaseModel):
+    card_instance_id: str
+    zone_index: int  # 0-3 for now
+    tribute_instance_ids: List[str] = []
+
+
+class AttackMonsterPayload(BaseModel):
+    attacker_instance_id: str
+    defender_instance_id: str  # must target a monster on the opponent's field
+
+
+class AttackPlayerPayload(BaseModel):
+    attacker_instance_id: str
+
+
 class BattleActionRequest(BaseModel):
     match_id: str
     player_index: int  # 1 or 2
-    action: Literal["END_TURN"]
+    action: Literal["END_TURN", "PLAY_MONSTER", "ATTACK_MONSTER", "ATTACK_PLAYER"]
+    play_monster: Optional[PlayMonsterPayload] = None
+    attack_monster: Optional[AttackMonsterPayload] = None
+    attack_player: Optional[AttackPlayerPayload] = None
 
 
 # -------------------------------------------------------------------
 # Simple health / test endpoints
 # -------------------------------------------------------------------
+
 
 @app.get("/health")
 def health_check() -> Dict[str, str]:
@@ -124,6 +142,7 @@ def test_supabase():
 # -------------------------------------------------------------------
 # Battle: Start a new match vs NPC
 # -------------------------------------------------------------------
+
 
 @app.post("/battle/start")
 def battle_start(payload: BattleStartRequest) -> Dict[str, Any]:
@@ -162,7 +181,6 @@ def battle_start(payload: BattleStartRequest) -> Dict[str, Any]:
     if not deck_row:
         raise HTTPException(status_code=404, detail="Deck not found")
 
-    # Optional: enforce that this deck is owned by the requesting player
     owner_id = deck_row.get("owner_id")
     if owner_id is not None and owner_id != payload.player_id:
         raise HTTPException(status_code=403, detail="Deck does not belong to this player")
@@ -172,7 +190,6 @@ def battle_start(payload: BattleStartRequest) -> Dict[str, Any]:
     if not npc:
         raise HTTPException(status_code=404, detail="No NPC with a deck found")
 
-    # npc table uses "display_name"
     npc_name = npc["display_name"]
     npc_deck_id = npc["deck_id"]
 
@@ -203,8 +220,8 @@ def battle_start(payload: BattleStartRequest) -> Dict[str, Any]:
     match_record = {
         "id": match_id,
         "player1_id": payload.player_id,
-        "npc_id": npc["id"],  # <-- NEW
-        "mode": "PVE",  # <-- NEW
+        "npc_id": npc["id"],
+        "mode": "PVE",
         "status": "in_progress",
         "serialized_game_state": game_state_dict,
     }
@@ -218,19 +235,19 @@ def battle_start(payload: BattleStartRequest) -> Dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# Battle: Take an action (v0: only END_TURN)
+# Battle: Take an action
 # -------------------------------------------------------------------
+
 
 @app.post("/battle/action")
 def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
     """
-    Minimal action endpoint for v0:
-    - Currently supports only END_TURN
-    - Loads match.game_state from Supabase
-    - Mutates turn/current_player/phase
-    - Applies simple Start+Draw for the next player
-    - Saves back to Supabase
-    - Returns updated game_state
+    v0 action endpoint:
+    - END_TURN
+    - PLAY_MONSTER
+    - ATTACK_MONSTER
+    - ATTACK_PLAYER
+    Loads match.game_state from Supabase, mutates, saves back, returns updated state.
     """
 
     # 1) Load the match + serialized_game_state
@@ -252,12 +269,23 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
     if not game_state:
         raise HTTPException(status_code=500, detail="Match has no game state stored")
 
+    # Also respect the status inside serialized game_state
+    if game_state.get("status") != "in_progress":
+        raise HTTPException(status_code=400, detail="Match is not in progress")
+
     # 2) Basic validation: is it this player's turn?
     current_player = game_state.get("current_player")
     if current_player != payload.player_index:
         raise HTTPException(status_code=400, detail="It is not this player's turn")
 
-    # 3) Handle the action
+    players = game_state.get("players") or {}
+    pkey = str(payload.player_index)
+    if pkey not in players:
+        raise HTTPException(status_code=500, detail="Player state missing")
+
+    # ----------------------------------------------------------------
+    # END_TURN
+    # ----------------------------------------------------------------
     if payload.action == "END_TURN":
         next_player = 2 if current_player == 1 else 1
 
@@ -266,20 +294,22 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
         game_state["current_player"] = next_player
 
         # ---- START OF TURN for next_player ----
-        players = game_state.get("players") or {}
-        pkey = str(next_player)
-        p_state = players.get(pkey)
+        nkey = str(next_player)
+        p_state = players.get(nkey)
         if p_state is None:
             raise HTTPException(status_code=500, detail="Next player state missing")
 
-        # 3a) Flip that player's monsters face-up
+        # Flip that player's monsters face-up AND ready them to attack
         monster_zones = p_state.get("monster_zones") or []
         for idx, slot in enumerate(monster_zones):
             if slot is not None:
                 slot["face_down"] = False
+                # if the monster is alive, it can attack this turn
+                if slot.get("hp", 0) > 0:
+                    slot["can_attack"] = True
         p_state["monster_zones"] = monster_zones
 
-        # 3b) Draw 2 cards
+        # Draw 2 cards
         deck = p_state.get("deck") or []
         hand = p_state.get("hand") or []
 
@@ -291,13 +321,13 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
         p_state["deck"] = deck
         p_state["hand"] = hand
 
-        players[pkey] = p_state
+        players[nkey] = p_state
         game_state["players"] = players
 
         # Set phase to MAIN for the new active player
         game_state["phase"] = "main"
 
-        # 3c) Log the event
+        # Log the event
         log = game_state.get("log") or []
         log.append(
             {
@@ -310,6 +340,346 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
         )
         game_state["log"] = log
 
+    # ----------------------------------------------------------------
+    # PLAY_MONSTER
+    # ----------------------------------------------------------------
+    elif payload.action == "PLAY_MONSTER":
+        if payload.play_monster is None:
+            raise HTTPException(status_code=400, detail="Missing play_monster payload")
+
+        pm = payload.play_monster
+        p_state = players[pkey]
+
+        monster_zones = p_state.get("monster_zones") or []
+        if pm.zone_index < 0 or pm.zone_index >= len(monster_zones):
+            raise HTTPException(status_code=400, detail="Invalid monster zone index")
+
+        if monster_zones[pm.zone_index] is not None:
+            raise HTTPException(status_code=400, detail="Monster zone is already occupied")
+
+        hand = p_state.get("hand") or []
+        hand_idx = next(
+            (i for i, c in enumerate(hand) if c["instance_id"] == pm.card_instance_id),
+            None,
+        )
+        if hand_idx is None:
+            raise HTTPException(status_code=400, detail="Card not in hand")
+
+        card = hand.pop(hand_idx)
+
+        # Simple tribute rule: 4+ stars require at least one tribute
+        tribute_ids = pm.tribute_instance_ids or []
+        is_tribute_summon = len(tribute_ids) > 0
+
+        if card.get("stars", 0) >= 4:
+            if not tribute_ids:
+                raise HTTPException(status_code=400, detail="Tributes required for high-star monster")
+
+            # remove tributes from monster_zones and send to graveyard
+            graveyard = p_state.get("graveyard") or []
+            for tid in tribute_ids:
+                found = False
+                for mz_index, mz_card in enumerate(monster_zones):
+                    if mz_card is not None and mz_card["instance_id"] == tid:
+                        graveyard.append(mz_card)
+                        monster_zones[mz_index] = None
+                        found = True
+                        break
+                if not found:
+                    raise HTTPException(status_code=400, detail=f"Tribute monster {tid} not found")
+            p_state["graveyard"] = graveyard
+
+        # Put the monster on the field
+        card["face_down"] = False
+        # Summoning sickness rules:
+        #   - Normal summon  -> cannot attack this turn
+        #   - Tribute summon -> can attack immediately
+        card["can_attack"] = bool(is_tribute_summon)
+
+        monster_zones[pm.zone_index] = card
+
+        p_state["monster_zones"] = monster_zones
+        p_state["hand"] = hand
+        players[pkey] = p_state
+        game_state["players"] = players
+
+        # Phase goes to MAIN once first monster is played
+        game_state["phase"] = "main"
+
+        log = game_state.get("log") or []
+        log.append(
+            {
+                "type": "PLAY_MONSTER",
+                "player": payload.player_index,
+                "card_instance_id": pm.card_instance_id,
+                "card_name": card.get("name"),
+                "zone": pm.zone_index,
+                "tributes": tribute_ids,
+                "stars": card.get("stars"),
+            }
+        )
+        game_state["log"] = log
+
+    # ----------------------------------------------------------------
+    # ATTACK_MONSTER (symmetric spillover combat)
+    # ----------------------------------------------------------------
+    elif payload.action == "ATTACK_MONSTER":
+        if payload.attack_monster is None:
+            raise HTTPException(status_code=400, detail="Missing attack_monster payload")
+
+        am = payload.attack_monster
+
+        atk_player_idx = payload.player_index
+        def_player_idx = 2 if atk_player_idx == 1 else 1
+
+        atk_pkey = str(atk_player_idx)
+        def_pkey = str(def_player_idx)
+
+        atk_state = players.get(atk_pkey)
+        def_state = players.get(def_pkey)
+        if atk_state is None or def_state is None:
+            raise HTTPException(status_code=500, detail="Player state missing")
+
+        # Locate attacker on field
+        atk_mz = atk_state.get("monster_zones") or []
+        attacker = None
+        attacker_zone_index = None
+        for idx, slot in enumerate(atk_mz):
+            if slot is not None and slot.get("instance_id") == am.attacker_instance_id:
+                attacker = slot
+                attacker_zone_index = idx
+                break
+
+        if attacker is None:
+            raise HTTPException(status_code=400, detail="Attacker not found on battlefield")
+
+        if not attacker.get("can_attack", False):
+            raise HTTPException(status_code=400, detail="This monster cannot attack right now")
+
+        if attacker.get("hp", 0) <= 0:
+            raise HTTPException(status_code=400, detail="This monster has been destroyed")
+
+        # Locate defender on field
+        def_mz = def_state.get("monster_zones") or []
+        defender = None
+        defender_zone_index = None
+        for idx, slot in enumerate(def_mz):
+            if slot is not None and slot.get("instance_id") == am.defender_instance_id:
+                defender = slot
+                defender_zone_index = idx
+                break
+
+        if defender is None:
+            raise HTTPException(status_code=400, detail="Defender not found on battlefield")
+
+        # Flip defender face-up if needed
+        defender["face_down"] = False
+
+        # Snapshot monster HP before combat
+        attacker_hp_before = attacker.get("hp", 0)
+        defender_hp_before = defender.get("hp", 0)
+        atk_value = max(attacker.get("atk", 0), 0)
+        def_value = max(defender.get("atk", 0), 0)
+
+        # Simultaneous damage to monsters
+        defender_hp_after = max(0, defender_hp_before - atk_value)
+        attacker_hp_after = max(0, attacker_hp_before - def_value)
+        defender["hp"] = defender_hp_after
+        attacker["hp"] = attacker_hp_after
+
+        # Spillover damage to players
+        overflow_to_defender_player = max(0, atk_value - defender_hp_before)
+        overflow_to_attacker_player = max(0, def_value - attacker_hp_before)
+
+        atk_player_hp_before = atk_state.get("hp", 0)
+        def_player_hp_before = def_state.get("hp", 0)
+
+        atk_player_hp_after = max(0, atk_player_hp_before - overflow_to_attacker_player)
+        def_player_hp_after = max(0, def_player_hp_before - overflow_to_defender_player)
+
+        atk_state["hp"] = atk_player_hp_after
+        def_state["hp"] = def_player_hp_after
+
+        atk_graveyard = atk_state.get("graveyard") or []
+        def_graveyard = def_state.get("graveyard") or []
+
+        defender_died = defender_hp_after <= 0
+        attacker_died = attacker_hp_after <= 0
+
+        # Move dead defender to graveyard
+        if defender_died:
+            def_graveyard.append(defender)
+            def_mz[defender_zone_index] = None
+
+        # Move dead attacker to graveyard or mark that it used its attack
+        if attacker_died:
+            atk_graveyard.append(attacker)
+            atk_mz[attacker_zone_index] = None
+        else:
+            attacker["can_attack"] = False
+            atk_mz[attacker_zone_index] = attacker
+
+        atk_state["monster_zones"] = atk_mz
+        atk_state["graveyard"] = atk_graveyard
+        def_state["monster_zones"] = def_mz
+        def_state["graveyard"] = def_graveyard
+
+        players[atk_pkey] = atk_state
+        players[def_pkey] = def_state
+        game_state["players"] = players
+
+        log = game_state.get("log") or []
+        log.append(
+            {
+                "type": "ATTACK_MONSTER",
+                "attacking_player": atk_player_idx,
+                "defending_player": def_player_idx,
+                "attacker_instance_id": am.attacker_instance_id,
+                "defender_instance_id": am.defender_instance_id,
+                "attacker_atk": atk_value,
+                "defender_atk": def_value,
+                "attacker_hp_before": attacker_hp_before,
+                "defender_hp_before": defender_hp_before,
+                "attacker_hp_after": attacker_hp_after,
+                "defender_hp_after": defender_hp_after,
+                "overflow_to_attacker_player": overflow_to_attacker_player,
+                "overflow_to_defender_player": overflow_to_defender_player,
+                "attacker_player_hp_before": atk_player_hp_before,
+                "attacker_player_hp_after": atk_player_hp_after,
+                "defender_player_hp_before": def_player_hp_before,
+                "defender_player_hp_after": def_player_hp_after,
+            }
+        )
+
+        # Lethal check after combat + spillover
+        winner: Optional[int] = None
+        atk_dead = atk_player_hp_after <= 0
+        def_dead = def_player_hp_after <= 0
+
+        if atk_dead and def_dead:
+            # Draw
+            game_state["status"] = "completed"
+            game_state["winner"] = None
+            log.append(
+                {
+                    "type": "MATCH_END",
+                    "winner": None,
+                    "reason": "double_lethal",
+                    "player1_hp": players["1"]["hp"],
+                    "player2_hp": players["2"]["hp"],
+                }
+            )
+        elif def_dead:
+            winner = atk_player_idx
+        elif atk_dead:
+            winner = def_player_idx
+
+        if winner is not None:
+            game_state["status"] = "completed"
+            game_state["winner"] = winner
+            log.append(
+                {
+                    "type": "MATCH_END",
+                    "winner": winner,
+                    "reason": "combat_lethal",
+                    "player1_hp": players["1"]["hp"],
+                    "player2_hp": players["2"]["hp"],
+                }
+            )
+
+        game_state["log"] = log
+
+    # ----------------------------------------------------------------
+    # ATTACK_PLAYER (direct attack when opponent has no monsters)
+    # ----------------------------------------------------------------
+    elif payload.action == "ATTACK_PLAYER":
+        if payload.attack_player is None:
+            raise HTTPException(status_code=400, detail="Missing attack_player payload")
+
+        ap = payload.attack_player
+
+        atk_player_idx = payload.player_index
+        def_player_idx = 2 if atk_player_idx == 1 else 1
+
+        atk_pkey = str(atk_player_idx)
+        def_pkey = str(def_player_idx)
+
+        atk_state = players.get(atk_pkey)
+        def_state = players.get(def_pkey)
+        if atk_state is None or def_state is None:
+            raise HTTPException(status_code=500, detail="Player state missing")
+
+        # Opponent must have NO monsters on the field for direct attack
+        def_mz = def_state.get("monster_zones") or []
+        if any(slot is not None for slot in def_mz):
+            raise HTTPException(
+                status_code=400,
+                detail="Opponent controls monsters; you must attack their monsters first",
+            )
+
+        # Locate attacker on field
+        atk_mz = atk_state.get("monster_zones") or []
+        attacker = None
+        attacker_zone_index = None
+        for idx, slot in enumerate(atk_mz):
+            if slot is not None and slot.get("instance_id") == ap.attacker_instance_id:
+                attacker = slot
+                attacker_zone_index = idx
+                break
+
+        if attacker is None:
+            raise HTTPException(status_code=400, detail="Attacker not found on battlefield")
+
+        if not attacker.get("can_attack", False):
+            raise HTTPException(status_code=400, detail="This monster cannot attack right now")
+
+        if attacker.get("hp", 0) <= 0:
+            raise HTTPException(status_code=400, detail="This monster has been destroyed")
+
+        atk_value = max(attacker.get("atk", 0), 0)
+
+        before_hp = def_state.get("hp", 0)
+        after_hp = max(before_hp - atk_value, 0)
+        def_state["hp"] = after_hp
+
+        # Attacker has used its attack this turn
+        attacker["can_attack"] = False
+        atk_mz[attacker_zone_index] = attacker
+
+        atk_state["monster_zones"] = atk_mz
+        players[atk_pkey] = atk_state
+        players[def_pkey] = def_state
+        game_state["players"] = players
+
+        log = game_state.get("log") or []
+        log.append(
+            {
+                "type": "ATTACK_PLAYER",
+                "attacking_player": atk_player_idx,
+                "defending_player": def_player_idx,
+                "attacker_instance_id": ap.attacker_instance_id,
+                "attacker_atk": atk_value,
+                "damage_to_player": atk_value,
+                "defender_hp_before": before_hp,
+                "defender_hp_after": after_hp,
+            }
+        )
+
+        # Check lethal
+        if after_hp <= 0:
+            game_state["status"] = "completed"
+            game_state["winner"] = atk_player_idx
+            log.append(
+                {
+                    "type": "MATCH_END",
+                    "winner": atk_player_idx,
+                    "loser": def_player_idx,
+                    "reason": "direct_attack",
+                }
+            )
+
+        game_state["log"] = log
+
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported action: {payload.action}")
 
@@ -317,6 +687,7 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
     supabase.table("matches").update(
         {
             "serialized_game_state": game_state,
+            "status": game_state.get("status", match_row.get("status")),
         }
     ).eq("id", payload.match_id).execute()
 
