@@ -1,41 +1,51 @@
-from __future__ import annotations
-
 import random
-from typing import Tuple, List, Dict
+from typing import Optional, Dict, Any
 
 from app.db.supabase_client import supabase
-from app.db.decks import load_deck_card_defs
 
 
-def load_npc_with_deck(npc_id: str) -> Tuple[Dict, List[Dict]]:
+def pick_random_npc_with_deck(npc_id: Optional[str] = None) -> Dict[str, Any]:
     """
-    Load a specific NPC (id, display_name, deck_id) and its deck defs.
+    Returns a single NPC row that has a deck_id.
+
+    - If npc_id is provided, returns that specific NPC (or raises if not found).
+    - If npc_id is None, picks a random NPC that has a non-null deck_id.
     """
-    resp = (
-        supabase.table("npcs")
-        .select("id, display_name, deck_id")
-        .eq("id", npc_id)
-        .single()
-        .execute()
-    )
-    npc = resp.data
-    if not npc:
-        raise ValueError(f"NPC {npc_id} not found")
 
-    deck_defs = load_deck_card_defs(npc["deck_id"])
-    return npc, deck_defs
+    # Columns: id, display_name, deck_id
+    columns = "id, display_name, deck_id"
 
+    if npc_id:
+        resp = (
+            supabase.table("npcs")
+            .select(columns)
+            .eq("id", npc_id)
+            .single()
+            .execute()
+        )
+        npc = resp.data
+        if not npc:
+            raise RuntimeError(f"NPC with id {npc_id} not found")
+        if not npc.get("deck_id"):
+            raise RuntimeError(f"NPC {npc_id} has no deck_id assigned")
 
-def pick_random_npc_with_deck() -> Tuple[Dict, List[Dict]]:
-    """
-    Load all NPCs, choose one at random in Python, and return npc + deck defs.
-    Fine for small NPC counts; later we can optimize with SQL/RPC if needed.
-    """
-    resp = supabase.table("npcs").select("id, display_name, deck_id").execute()
-    npcs = resp.data or []
-    if not npcs:
-        raise RuntimeError("No NPCs defined in npcs table")
+        # Normalize expected field name
+        npc["name"] = npc["display_name"]
+        return npc
 
-    npc = random.choice(npcs)
-    deck_defs = load_deck_card_defs(npc["deck_id"])
-    return npc, deck_defs
+    # Load all NPCs
+    resp = supabase.table("npcs").select(columns).execute()
+    rows = resp.data or []
+
+    # Only NPCs with assigned decks
+    valid_rows = [r for r in rows if r.get("deck_id")]
+
+    if not valid_rows:
+        raise RuntimeError("No NPCs with decks found in 'npcs' table")
+
+    npc = random.choice(valid_rows)
+
+    # Normalize expected field name
+    npc["name"] = npc["display_name"]
+
+    return npc

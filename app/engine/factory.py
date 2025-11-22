@@ -1,116 +1,119 @@
 from __future__ import annotations
 
 import random
-from typing import List, Dict
+from typing import List, Dict, Any
 
-from .models import (
+from app.engine.models import (
     CardInstance,
     PlayerState,
     GameState,
-    CardType
+    Phase,
+    MatchStatus,
 )
 
 
-# Temporary constant (we can make this configurable later)
-STARTING_HAND_SIZE = 5
-
-
-def build_deck_instances(deck_cards: List[dict]) -> List[CardInstance]:
-    """
-    deck_cards is a list of dicts representing card definitions:
-    [
-        { "card_code": "...", "name": "...", "card_type": "monster", "atk": 100, "hp": 100, ... },
-        ...
-    ]
-
-    This produces a shuffled list of CardInstance objects.
-    """
-    instances: List[CardInstance] = []
-
-    for card_def in deck_cards:
-        instance = CardInstance.new_from_definition(card_def)
-        instances.append(instance)
-
-    random.shuffle(instances)
-    return instances
-
-
-def draw_cards(deck: List[CardInstance], n: int) -> List[CardInstance]:
-    """
-    Removes top n cards from the deck and returns them.
-    """
-    drawn = deck[:n]
-    del deck[:n]
-    return drawn
-
-
-def initialize_player(
+def build_player_state(
+    *,
     player_index: int,
-    player_name: str,
-    deck_def: List[dict]
+    name: str,
+    deck_defs: List[Dict[str, Any]],
 ) -> PlayerState:
     """
-    Create PlayerState:
-    - Build deck from card definitions
-    - Draw a starting hand
-    """
-    deck_instances = build_deck_instances(deck_def)
-    hand = draw_cards(deck_instances, STARTING_HAND_SIZE)
+    Build a PlayerState from a list of card definitions.
 
-    p = PlayerState(
+    `deck_defs` is expected to be a list of dicts coming from `load_deck_card_defs`,
+    each with fields like:
+      - card_code
+      - name
+      - card_type      (string: "monster" | "spell" | "trap" | "hero")
+      - stars
+      - atk
+      - hp
+      - element_id
+      - effect_tags
+      - effect_params
+    """
+
+    # Turn deck defs into runtime instances
+    deck_instances: List[CardInstance] = [
+        CardInstance.new_from_definition(card_def, face_down=True)
+        for card_def in deck_defs
+    ]
+
+    # Shuffle deck
+    random.shuffle(deck_instances)
+
+    # Draw starting hand (5 cards)
+    starting_hand: List[CardInstance] = []
+    draws = min(5, len(deck_instances))
+    for _ in range(draws):
+        starting_hand.append(deck_instances.pop(0))
+
+    # Create the player state
+    player_state = PlayerState(
         player_index=player_index,
-        name=player_name,
+        name=name,
+        hp=1500,
         deck=deck_instances,
-        hand=hand
+        hand=starting_hand,
+        # monster_zones, spell_trap_zones, hero, graveyard, exile,
+        # hero_charges are all handled by the dataclass defaults.
     )
 
-    return p
+    return player_state
 
 
 def create_new_game_state(
+    *,
     match_id: str,
     player1_name: str,
-    player1_deck: List[dict],
     player2_name: str,
-    player2_deck: List[dict]
+    deck1_defs: List[Dict[str, Any]],
+    deck2_defs: List[Dict[str, Any]],
 ) -> GameState:
     """
-    The master factory function.
-    Given deck definitions for P1 + P2,
-    returns a fully initialized GameState:
-    - Turn = 1
-    - Current player = 1
-    - Both players have 5-card hands
-    - Hero slots empty
+    Factory to build a brand new GameState for a 1v1 match.
+
+    - match_id: UUID for this match (stored in `matches` table)
+    - player1_name: human player display name (e.g., "Nabbed")
+    - player2_name: NPC or other player's display name (e.g., "Ornn")
+    - deck1_defs: list of card definitions for player 1's deck
+    - deck2_defs: list of card definitions for player 2's deck
     """
 
-    p1_state = initialize_player(
+    p1_state = build_player_state(
         player_index=1,
-        player_name=player1_name,
-        deck_def=player1_deck
+        name=player1_name,
+        deck_defs=deck1_defs,
     )
 
-    p2_state = initialize_player(
+    p2_state = build_player_state(
         player_index=2,
-        player_name=player2_name,
-        deck_def=player2_deck
+        name=player2_name,
+        deck_defs=deck2_defs,
     )
 
     game_state = GameState(
         match_id=match_id,
         turn=1,
         current_player=1,
+        phase=Phase.START,
+        status=MatchStatus.IN_PROGRESS,
+        winner=None,
         players={
             1: p1_state,
-            2: p2_state
-        }
+            2: p2_state,
+        },
+        log=[],
     )
 
-    # Log event for clients/UI
-    game_state.log.append({
-        "type": "GAME_INIT",
-        "player1": player1_name,
-        "player2": player2_name
-    })
+    # Initial log entry
+    game_state.log.append(
+        {
+            "type": "GAME_INIT",
+            "player1": player1_name,
+            "player2": player2_name,
+        }
+    )
 
     return game_state
