@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 from typing import Any, Dict, Literal, List, Optional
-import json  # NEW
+import json  # for parsing effect_params if stored as text
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -129,6 +129,19 @@ class PlayTrapPayload(BaseModel):
     zone_index: int
 
 
+class ActivateTrapPayload(BaseModel):
+    """
+    Manual trap activation for v0 testing.
+
+    - trap_instance_id: trap currently set in your spell/trap zone
+    - target_player_index / target_monster_instance_id: optional targets
+      depending on the trap's effects.
+    """
+    trap_instance_id: str
+    target_player_index: Optional[int] = None
+    target_monster_instance_id: Optional[str] = None
+
+
 class AttackMonsterPayload(BaseModel):
     attacker_instance_id: str
     defender_instance_id: str  # must target a monster on the opponent's field
@@ -144,14 +157,16 @@ class BattleActionRequest(BaseModel):
     action: Literal[
         "END_TURN",
         "PLAY_MONSTER",
-        "PLAY_SPELL",   # NEW
-        "PLAY_TRAP",    # NEW
+        "PLAY_SPELL",
+        "PLAY_TRAP",
+        "ACTIVATE_TRAP",  # NEW
         "ATTACK_MONSTER",
         "ATTACK_PLAYER",
     ]
     play_monster: Optional[PlayMonsterPayload] = None
     play_spell: Optional[PlaySpellPayload] = None
     play_trap: Optional[PlayTrapPayload] = None
+    activate_trap: Optional[ActivateTrapPayload] = None
     attack_monster: Optional[AttackMonsterPayload] = None
     attack_player: Optional[AttackPlayerPayload] = None
 
@@ -223,7 +238,7 @@ def _check_lethal_after_noncombat(
     reason: str,
 ) -> None:
     """
-    Shared lethal check for non-combat effects (spells).
+    Shared lethal check for non-combat effects (spells/traps).
     Uses same semantics as ATTACK_* branches: 0 or below = dead.
     """
     p1_hp = players.get("1", {}).get("hp", 0)
@@ -380,6 +395,7 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
     - PLAY_MONSTER
     - PLAY_SPELL
     - PLAY_TRAP
+    - ACTIVATE_TRAP
     - ATTACK_MONSTER
     - ATTACK_PLAYER
     Loads match.game_state from Supabase, mutates, saves back, returns updated state.
@@ -775,7 +791,11 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
             # Draw cards for the caster
             # -----------------------------------------------------------------
             elif keyword == "SPELL_DRAW_CARDS":
-                amount = int(eff.get("amount", 0))
+                # Support both `count` (what your CSV uses) and `amount` (old)
+                count_raw = eff.get("count")
+                if count_raw is None:
+                    count_raw = eff.get("amount", 0)
+                amount = int(count_raw)
 
                 deck = p_state.get("deck") or []
                 hand = p_state.get("hand") or []
@@ -800,7 +820,8 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
             # Apply a status to a monster (BURNING, FROZEN, etc.)
             # -----------------------------------------------------------------
             elif keyword == "SPELL_APPLY_STATUS":
-                status_code = eff.get("status")
+                # Support both `status` and `status_code`
+                status_code = eff.get("status") or eff.get("status_code")
                 if not status_code:
                     continue
 
@@ -888,8 +909,16 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                 tgt_state = players[tgt_pkey]
                 tgt_card = found["card"]
 
-                atk_delta = int(eff.get("amount_atk", 0))
-                hp_delta = int(eff.get("amount_hp", 0))
+                # Support both old names and your CSV names
+                atk_raw = eff.get("amount_atk")
+                if atk_raw is None:
+                    atk_raw = eff.get("atk_delta", 0)
+                hp_raw = eff.get("amount_hp")
+                if hp_raw is None:
+                    hp_raw = eff.get("hp_delta", 0)
+
+                atk_delta = int(atk_raw)
+                hp_delta = int(hp_raw)
 
                 before_atk = tgt_card.get("atk", 0)
                 before_hp = tgt_card.get("hp", 0)
@@ -993,6 +1022,258 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                 "card_name": card.get("name"),
                 "zone": pt.zone_index,
             }
+        )
+
+    # ----------------------------------------------------------------
+    # ACTIVATE_TRAP (manual activation for testing)
+    # ----------------------------------------------------------------
+    elif payload.action == "ACTIVATE_TRAP":
+        if payload.activate_trap is None:
+            raise HTTPException(status_code=400, detail="Missing activate_trap payload")
+
+        atp = payload.activate_trap
+        p_state = players[pkey]
+
+        st_zones = p_state.get("spell_trap_zones") or []
+        trap_card = None
+        trap_zone_index = None
+        for idx, slot in enumerate(st_zones):
+            if slot is not None and slot.get("instance_id") == atp.trap_instance_id:
+                trap_card = slot
+                trap_zone_index = idx
+                break
+
+        if trap_card is None or trap_zone_index is None:
+            raise HTTPException(status_code=400, detail="Trap card not found on battlefield")
+
+        card_type = trap_card.get("card_type")
+        if card_type not in ("trap", 3, "3"):
+            raise HTTPException(status_code=400, detail="Selected card is not a trap")
+
+        # Convenience: player HP refs
+        atk_player_idx = payload.player_index
+        def_player_idx = _other_player_index(atk_player_idx)
+        atk_pkey = str(atk_player_idx)
+        def_pkey = str(def_player_idx)
+        atk_state = players[atk_pkey]
+        def_state = players[def_pkey]
+
+        target_player_index = atp.target_player_index
+        target_monster_instance_id = atp.target_monster_instance_id
+
+        effects = _get_effects_from_card(trap_card)
+
+        trap_log_entry: Dict[str, Any] = {
+            "type": "ACTIVATE_TRAP",
+            "player": atk_player_idx,
+            "trap_instance_id": atp.trap_instance_id,
+            "card_name": trap_card.get("name"),
+            "effects": [],
+        }
+
+        for eff in effects:
+            keyword = eff.get("keyword")
+            if not keyword:
+                continue
+
+            # For immediate trap effects we reuse the same keywords as spells
+            if keyword == "SPELL_DAMAGE_MONSTER":
+                amount = int(eff.get("amount", 0))
+                overflow_to_player = bool(eff.get("overflow_to_player", False))
+
+                if not target_monster_instance_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="SPELL_DAMAGE_MONSTER requires target_monster_instance_id",
+                    )
+
+                found = _find_monster_by_instance(players, target_monster_instance_id)
+                if not found:
+                    raise HTTPException(status_code=400, detail="Target monster not found")
+
+                tgt_player_idx = found["player_index"]
+                tgt_pkey = str(tgt_player_idx)
+                tgt_state = players[tgt_pkey]
+                tgt_card = found["card"]
+                zone_index = found["zone_index"]
+
+                before_hp = tgt_card.get("hp", 0)
+                after_hp = max(0, before_hp - amount)
+                tgt_card["hp"] = after_hp
+
+                overflow = max(0, amount - before_hp) if overflow_to_player else 0
+
+                if overflow > 0:
+                    p_hp_before = tgt_state.get("hp", 0)
+                    p_hp_after = max(0, p_hp_before - overflow)
+                    tgt_state["hp"] = p_hp_after
+
+                # If monster dies, send to graveyard
+                if after_hp <= 0:
+                    graveyard = tgt_state.get("graveyard") or []
+                    monster_zones = tgt_state.get("monster_zones") or []
+                    graveyard.append(tgt_card)
+                    monster_zones[zone_index] = None
+                    tgt_state["graveyard"] = graveyard
+                    tgt_state["monster_zones"] = monster_zones
+
+                players[tgt_pkey] = tgt_state
+
+                trap_log_entry["effects"].append(
+                    {
+                        "keyword": keyword,
+                        "target_player": tgt_player_idx,
+                        "target_monster_instance_id": target_monster_instance_id,
+                        "amount": amount,
+                        "monster_hp_before": before_hp,
+                        "monster_hp_after": after_hp,
+                        "overflow_to_player": overflow if overflow_to_player else 0,
+                    }
+                )
+
+            elif keyword == "SPELL_HEAL_MONSTER":
+                amount = int(eff.get("amount", 0))
+
+                if not target_monster_instance_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="SPELL_HEAL_MONSTER requires target_monster_instance_id",
+                    )
+
+                found = _find_monster_by_instance(players, target_monster_instance_id)
+                if not found:
+                    raise HTTPException(status_code=400, detail="Target monster not found")
+
+                tgt_player_idx = found["player_index"]
+                tgt_pkey = str(tgt_player_idx)
+                tgt_state = players[tgt_pkey]
+                tgt_card = found["card"]
+
+                max_hp = tgt_card.get("max_hp", tgt_card.get("hp", 0))
+                before_hp = tgt_card.get("hp", 0)
+                after_hp = min(max_hp, before_hp + amount)
+                tgt_card["hp"] = after_hp
+
+                trap_log_entry["effects"].append(
+                    {
+                        "keyword": keyword,
+                        "target_player": tgt_player_idx,
+                        "target_monster_instance_id": target_monster_instance_id,
+                        "amount": amount,
+                        "hp_before": before_hp,
+                        "hp_after": after_hp,
+                    }
+                )
+
+            elif keyword == "SPELL_BUFF_MONSTER":
+                if not target_monster_instance_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="SPELL_BUFF_MONSTER requires target_monster_instance_id",
+                    )
+
+                found = _find_monster_by_instance(players, target_monster_instance_id)
+                if not found:
+                    raise HTTPException(status_code=400, detail="Target monster not found")
+
+                tgt_player_idx = found["player_index"]
+                tgt_pkey = str(tgt_player_idx)
+                tgt_state = players[tgt_pkey]
+                tgt_card = found["card"]
+
+                atk_raw = eff.get("amount_atk")
+                if atk_raw is None:
+                    atk_raw = eff.get("atk_delta", 0)
+                hp_raw = eff.get("amount_hp")
+                if hp_raw is None:
+                    hp_raw = eff.get("hp_delta", 0)
+
+                atk_delta = int(atk_raw)
+                hp_delta = int(hp_raw)
+
+                before_atk = tgt_card.get("atk", 0)
+                before_hp = tgt_card.get("hp", 0)
+                before_max_hp = tgt_card.get("max_hp", before_hp)
+
+                tgt_card["atk"] = before_atk + atk_delta
+                tgt_card["hp"] = before_hp + hp_delta
+                tgt_card["max_hp"] = before_max_hp + hp_delta
+
+                trap_log_entry["effects"].append(
+                    {
+                        "keyword": keyword,
+                        "target_player": tgt_player_idx,
+                        "target_monster_instance_id": target_monster_instance_id,
+                        "atk_before": before_atk,
+                        "atk_after": tgt_card["atk"],
+                        "hp_before": before_hp,
+                        "hp_after": tgt_card["hp"],
+                        "max_hp_before": before_max_hp,
+                        "max_hp_after": tgt_card["max_hp"],
+                    }
+                )
+
+            elif keyword == "SPELL_APPLY_STATUS":
+                status_code = eff.get("status") or eff.get("status_code")
+                if not status_code:
+                    continue
+
+                if not target_monster_instance_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="SPELL_APPLY_STATUS requires target_monster_instance_id",
+                    )
+
+                found = _find_monster_by_instance(players, target_monster_instance_id)
+                if not found:
+                    raise HTTPException(status_code=400, detail="Target monster not found")
+
+                tgt_player_idx = found["player_index"]
+                tgt_pkey = str(tgt_player_idx)
+                tgt_state = players[tgt_pkey]
+                tgt_card = found["card"]
+
+                statuses = tgt_card.get("statuses") or []
+                if status_code not in statuses:
+                    statuses.append(status_code)
+                tgt_card["statuses"] = statuses
+
+                trap_log_entry["effects"].append(
+                    {
+                        "keyword": keyword,
+                        "target_player": tgt_player_idx,
+                        "target_monster_instance_id": target_monster_instance_id,
+                        "status": status_code,
+                    }
+                )
+
+            else:
+                # Not-yet-implemented trap keyword, just log it
+                trap_log_entry["effects"].append(
+                    {
+                        "keyword": keyword,
+                        "unresolved": True,
+                    }
+                )
+
+        # Remove trap from zone and put into graveyard
+        st_zones[trap_zone_index] = None
+        p_state["spell_trap_zones"] = st_zones
+
+        graveyard = p_state.get("graveyard") or []
+        graveyard.append(trap_card)
+        p_state["graveyard"] = graveyard
+
+        players[pkey] = p_state
+        game_state["players"] = players
+
+        log.append(trap_log_entry)
+
+        _check_lethal_after_noncombat(
+            game_state=game_state,
+            players=players,
+            log=log,
+            reason="trap_effects",
         )
 
     # ----------------------------------------------------------------
