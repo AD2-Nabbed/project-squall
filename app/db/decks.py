@@ -44,7 +44,7 @@ def load_deck_card_defs(deck_id: str) -> List[Dict[str, Any]]:
         supabase.table("deck_cards")
         .select(
             "card_code, quantity, "
-            "cards(name, card_type_id, stars, atk, hp, element_id, effect_tags, effect_params)"
+            "cards(name, card_type_id, stars, atk, hp, element_id, effect_tags, effect_params, rules_text, art_asset_id)"
         )
         .eq("deck_id", deck_id)
         .execute()
@@ -62,12 +62,15 @@ def load_deck_card_defs(deck_id: str) -> List[Dict[str, Any]]:
             "card_code": row["card_code"],
             "name": card_row["name"],
             "card_type": card_type_code,
-            "stars": card_row["stars"],
+            "stars": card_row.get("stars") or 0,
             "atk": card_row.get("atk") or 0,
             "hp": card_row.get("hp") or 0,
             "element_id": card_row.get("element_id"),
             "effect_tags": card_row.get("effect_tags") or [],
             "effect_params": card_row.get("effect_params") or {},
+            # Use rules_text only for description (flavor_text is just for fun, not needed during playtest)
+            "description": card_row.get("rules_text") or "",
+            "art_asset_id": card_row.get("art_asset_id") or "",
         }
 
         qty = int(row.get("quantity") or 0)

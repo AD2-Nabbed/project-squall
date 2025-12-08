@@ -361,17 +361,40 @@ def handle_spell_damage_monster(
 
     result = _apply_damage_to_monster(ctx, amount)
 
-    # Optional overflow to the defending player if the monster died and there
-    # was "excess" damage. The action layer should set ctx.targets["player"]
-    # appropriately for this spell if you want overflow.
-    if overflow_to_player and result.destroyed_monsters:
-        overflow_amount = amount  # simple model: all damage overflows on kill
-        target_player_index = ctx.targets.get("player")
-        if isinstance(target_player_index, int):
-            overflow_res = _apply_damage_to_player(
-                ctx.game_state, target_player_index, overflow_amount
-            )
-            _merge_effect_results(result, overflow_res)
+    # Optional overflow to the defending player if there was excess damage.
+    # Overflow = max(0, damage_amount - monster_hp_before)
+    # Example: 150 damage to 150 HP monster = 0 overflow
+    #          150 damage to 100 HP monster = 50 overflow
+    #          150 damage to 0 HP monster = 150 overflow
+    if overflow_to_player:
+        # Get the monster's HP before damage from the log event
+        hp_before = None
+        if result.log_events:
+            for event in result.log_events:
+                if event.get("type") == "EFFECT_DAMAGE_MONSTER":
+                    hp_before = event.get("hp_before", 0)
+                    break
+        
+        if hp_before is not None:
+            # Calculate overflow: excess damage beyond what was needed to kill the monster
+            overflow_amount = max(0, amount - hp_before)
+            
+            if overflow_amount > 0:
+                # Get the target player (the controller of the monster that was damaged)
+                target_player_index = ctx.targets.get("player")
+                if not isinstance(target_player_index, int):
+                    # If not specified, get it from the monster that was damaged
+                    if result.log_events:
+                        for event in result.log_events:
+                            if event.get("type") == "EFFECT_DAMAGE_MONSTER":
+                                target_player_index = event.get("player_index")
+                                break
+                
+                if isinstance(target_player_index, int):
+                    overflow_res = _apply_damage_to_player(
+                        ctx.game_state, target_player_index, overflow_amount
+                    )
+                    _merge_effect_results(result, overflow_res)
 
     return result
 
@@ -459,49 +482,107 @@ def handle_spell_draw_cards(
 def handle_spell_buff_monster(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
-    ref = _get_monster_ref_from_targets(ctx)
-    if not ref:
-        return EffectResult(
-            log_events=[
-                {
-                    "type": "EFFECT_NO_TARGET",
-                    "reason": "MONSTER_NOT_FOUND",
-                    "card_code": ctx.source_card.get("card_code"),
-                }
-            ]
-        )
-
     # Support both naming conventions
     atk_inc = int(params.get("atk_increase") or params.get("amount_atk") or params.get("atk_delta", 0))
     hp_inc = int(params.get("hp_increase") or params.get("amount_hp") or params.get("hp_delta", 0))
-
-    player_index, zone_index, card = ref
-    before_atk = card.get("atk", 0)
-    before_hp = card.get("hp", 0)
-    before_max_hp = card.get("max_hp") or before_hp
-
-    card["atk"] = before_atk + atk_inc
-    new_hp = before_hp + hp_inc
-    new_max_hp = before_max_hp + hp_inc
-    card["hp"] = _clamp_hp(new_hp, new_max_hp)
-    card["max_hp"] = new_max_hp  # Update max_hp for buffs
-
-    return EffectResult(
-        log_events=[
-            {
-                "type": "EFFECT_BUFF_MONSTER",
-                "player_index": player_index,
-                "zone_index": zone_index,
-                "atk_before": before_atk,
-                "atk_after": card["atk"],
-                "hp_before": before_hp,
-                "hp_after": card["hp"],
-                "max_hp_before": before_max_hp,
-                "max_hp_after": new_max_hp,
-                "card_instance_id": card.get("instance_id"),
-            }
-        ]
-    )
+    
+    # Check if this should target all monsters
+    target_all = params.get("target_all", False) or params.get("target") == "ALL_MONSTERS"
+    target_self = params.get("target") == "SELF_MONSTERS" or params.get("target") == "OWN_MONSTERS"
+    
+    result = EffectResult()
+    game_state = ctx.game_state
+    players = game_state.get("players", {})
+    
+    if target_all or target_self:
+        # Buff all monsters on the caster's side (or both sides if target_all)
+        target_players = [ctx.source_player] if target_self else [1, 2]
+        
+        for p_idx in target_players:
+            pkey = str(p_idx)
+            p_state = players.get(pkey)
+            if not p_state:
+                continue
+            
+            monster_zones = p_state.get("monster_zones") or []
+            for zone_idx, card in enumerate(monster_zones):
+                if card is None:
+                    continue
+                
+                before_atk = card.get("atk", 0)
+                before_hp = card.get("hp", 0)
+                before_max_hp = card.get("max_hp") or before_hp
+                
+                card["atk"] = before_atk + atk_inc
+                new_hp = before_hp + hp_inc
+                new_max_hp = before_max_hp + hp_inc
+                card["hp"] = _clamp_hp(new_hp, new_max_hp)
+                card["max_hp"] = new_max_hp
+                
+                result.log_events.append({
+                    "type": "EFFECT_BUFF_MONSTER",
+                    "player_index": p_idx,
+                    "zone_index": zone_idx,
+                    "atk_before": before_atk,
+                    "atk_after": card["atk"],
+                    "hp_before": before_hp,
+                    "hp_after": card["hp"],
+                    "max_hp_before": before_max_hp,
+                    "max_hp_after": new_max_hp,
+                    "card_instance_id": card.get("instance_id"),
+                })
+    else:
+        # Single target mode
+        ref = _get_monster_ref_from_targets(ctx)
+        if not ref:
+            return EffectResult(
+                log_events=[
+                    {
+                        "type": "EFFECT_NO_TARGET",
+                        "reason": "MONSTER_NOT_FOUND",
+                        "card_code": ctx.source_card.get("card_code"),
+                    }
+                ]
+            )
+        
+        player_index, zone_index, card = ref
+        
+        # Ensure we're only buffing friendly monsters (not enemy monsters)
+        if player_index != ctx.source_player:
+            return EffectResult(
+                log_events=[
+                    {
+                        "type": "EFFECT_INVALID_TARGET",
+                        "reason": "CANNOT_BUFF_ENEMY_MONSTER",
+                        "card_code": ctx.source_card.get("card_code"),
+                    }
+                ]
+            )
+        
+        before_atk = card.get("atk", 0)
+        before_hp = card.get("hp", 0)
+        before_max_hp = card.get("max_hp") or before_hp
+        
+        card["atk"] = before_atk + atk_inc
+        new_hp = before_hp + hp_inc
+        new_max_hp = before_max_hp + hp_inc
+        card["hp"] = _clamp_hp(new_hp, new_max_hp)
+        card["max_hp"] = new_max_hp
+        
+        result.log_events.append({
+            "type": "EFFECT_BUFF_MONSTER",
+            "player_index": player_index,
+            "zone_index": zone_index,
+            "atk_before": before_atk,
+            "atk_after": card["atk"],
+            "hp_before": before_hp,
+            "hp_after": card["hp"],
+            "max_hp_before": before_max_hp,
+            "max_hp_after": new_max_hp,
+            "card_instance_id": card.get("instance_id"),
+        })
+    
+    return result
 
 
 def handle_spell_cleanse_monster(
@@ -644,6 +725,71 @@ def handle_spell_duplicate_incoming_status(
     return result
 
 
+def handle_trap_prevent_destruction(
+    ctx: EffectContext, params: Dict[str, Any]
+) -> EffectResult:
+    """
+    Prevents a monster from being destroyed by setting its HP to a minimum value (default 1).
+    
+    The action layer should:
+      - Call this when a trap with ON_ALLY_MONSTER_WOULD_BE_DESTROYED is triggered.
+      - The trigger_event should contain monster_instance_id, player_index, zone_index.
+      - This handler will set the monster's HP to prevent_destruction_hp (default 1).
+    """
+    # Get target monster from trigger_event or targets
+    trigger_event = ctx.trigger_event or {}
+    monster_instance_id = trigger_event.get("monster_instance_id")
+    
+    # Try to find monster from targets first
+    ref = _get_monster_ref_from_targets(ctx)
+    if not ref and monster_instance_id:
+        # Fallback: find by instance_id from trigger_event
+        from app.engine.game_state_helpers import find_monster_by_instance_id
+        found = find_monster_by_instance_id(ctx.game_state, monster_instance_id)
+        if found:
+            ref = (found["player_index"], found["zone_index"], found["card"])
+    
+    if not ref:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "MONSTER_NOT_FOUND",
+                    "card_code": ctx.source_card.get("card_code"),
+                }
+            ]
+        )
+    
+    player_index, zone_index, card = ref
+    
+    # Get HP to set (default 1)
+    prevent_destruction_hp = int(params.get("prevent_destruction_hp", 1))
+    
+    hp_before = card.get("hp", 0)
+    hp_after = max(prevent_destruction_hp, hp_before)  # Don't reduce HP, only prevent destruction
+    
+    # Only set HP if monster would be destroyed (HP <= 0)
+    if hp_before <= 0:
+        card["hp"] = prevent_destruction_hp
+        hp_after = prevent_destruction_hp
+    else:
+        # Monster wasn't destroyed, no change needed
+        hp_after = hp_before
+    
+    return EffectResult(
+        log_events=[
+            {
+                "type": "EFFECT_PREVENT_DESTRUCTION",
+                "player_index": player_index,
+                "zone_index": zone_index,
+                "card_instance_id": card.get("instance_id"),
+                "hp_before": hp_before,
+                "hp_after": hp_after,
+            }
+        ]
+    )
+
+
 # --- Registry -------------------------------------------------------------------
 
 
@@ -661,6 +807,7 @@ KEYWORD_HANDLERS: Dict[str, KeywordHandler] = {
     "SPELL_COUNTER_SPELL": handle_spell_counter_spell,
     "TRAP_REFLECT_DAMAGE": handle_trap_reflect_damage,
     "TRAP_APPLY_STATUS": handle_trap_apply_status,
+    "TRAP_PREVENT_DESTRUCTION": handle_trap_prevent_destruction,
     "SPELL_REFLECT_INCOMING_STATUS": handle_spell_reflect_incoming_status,
     "SPELL_DUPLICATE_INCOMING_STATUS": handle_spell_duplicate_incoming_status,
 }

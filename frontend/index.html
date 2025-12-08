@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Project Squall - Card Battle</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>Project Squall</h1>
+            <div class="match-info" id="matchInfo">
+                <span id="turnInfo">Turn: 1</span>
+                <span id="phaseInfo">Phase: Start</span>
+            </div>
+        </header>
+
+        <!-- Game Setup -->
+        <div class="setup-panel" id="setupPanel">
+            <h2>Start New Match</h2>
+            <div class="input-group">
+                <label for="matchMode">Match Mode:</label>
+                <select id="matchMode" onchange="toggleMatchMode()">
+                    <option value="PVE" selected>PVE (vs AI)</option>
+                    <option value="PVP">PVP (vs Player)</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <label for="playerId">Player 1 ID:</label>
+                <input type="text" id="playerId" placeholder="Enter player UUID" value="d4ac398c-12a6-4cf3-836e-8ede11835029">
+            </div>
+            <div class="input-group">
+                <label for="deckId">Player 1 Deck ID:</label>
+                <input type="text" id="deckId" placeholder="Enter deck UUID" value="909b20ce-a5a9-4cd5-8c00-7869ef23635b">
+            </div>
+            <div class="input-group" id="player2Group" style="display: none;">
+                <label for="player2Id">Player 2 ID:</label>
+                <input type="text" id="player2Id" placeholder="Enter player 2 UUID">
+            </div>
+            <div class="input-group" id="player2DeckGroup" style="display: none;">
+                <label for="player2DeckId">Player 2 Deck ID:</label>
+                <input type="text" id="player2DeckId" placeholder="Enter player 2 deck UUID">
+            </div>
+            <button class="btn btn-primary" onclick="startMatch()">Start Match</button>
+        </div>
+
+        <!-- Game Board -->
+        <div class="game-board" id="gameBoard" style="display: none;">
+            <!-- Opponent Area -->
+            <div class="player-area opponent-area">
+                <div class="player-header">
+                    <span class="player-name" id="opponentName">Opponent</span>
+                    <span class="player-hp" id="opponentHp">1500 HP</span>
+                </div>
+                
+                <!-- Opponent Hero Zone -->
+                <div class="hero-zone">
+                    <div class="zone-label">Hero</div>
+                    <div class="hero-card" id="opponentHero">-</div>
+                </div>
+
+                <!-- Opponent Monster Zones -->
+                <div class="monster-zones">
+                    <div class="zone-label">Monsters</div>
+                    <div class="zones-grid" id="opponentMonsters">
+                        <div class="zone-slot" data-zone="0">-</div>
+                        <div class="zone-slot" data-zone="1">-</div>
+                        <div class="zone-slot" data-zone="2">-</div>
+                        <div class="zone-slot" data-zone="3">-</div>
+                    </div>
+                </div>
+
+                <!-- Opponent Spell/Trap Zones -->
+                <div class="spell-trap-zones">
+                    <div class="zone-label">Spells/Traps</div>
+                    <div class="zones-grid" id="opponentSpellTraps">
+                        <div class="zone-slot" data-zone="0">-</div>
+                        <div class="zone-slot" data-zone="1">-</div>
+                        <div class="zone-slot" data-zone="2">-</div>
+                        <div class="zone-slot" data-zone="3">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Player Area -->
+            <div class="player-area player-area-self">
+                <!-- Player Spell/Trap Zones -->
+                <div class="spell-trap-zones">
+                    <div class="zone-label">Spells/Traps</div>
+                    <div class="zones-grid" id="playerSpellTraps">
+                        <div class="zone-slot" data-zone="0" onclick="selectSpellTrapZone(0)">-</div>
+                        <div class="zone-slot" data-zone="1" onclick="selectSpellTrapZone(1)">-</div>
+                        <div class="zone-slot" data-zone="2" onclick="selectSpellTrapZone(2)">-</div>
+                        <div class="zone-slot" data-zone="3" onclick="selectSpellTrapZone(3)">-</div>
+                    </div>
+                </div>
+
+                <!-- Player Monster Zones -->
+                <div class="monster-zones">
+                    <div class="zone-label">Monsters</div>
+                    <div class="zones-grid" id="playerMonsters">
+                        <div class="zone-slot" data-zone="0" onclick="selectMonsterZone(0)">-</div>
+                        <div class="zone-slot" data-zone="1" onclick="selectMonsterZone(1)">-</div>
+                        <div class="zone-slot" data-zone="2" onclick="selectMonsterZone(2)">-</div>
+                        <div class="zone-slot" data-zone="3" onclick="selectMonsterZone(3)">-</div>
+                    </div>
+                </div>
+
+                <!-- Player Hero Zone -->
+                <div class="hero-zone">
+                    <div class="zone-label">Hero</div>
+                    <div class="hero-card" id="playerHero">-</div>
+                </div>
+
+                <div class="player-header">
+                    <span class="player-name" id="playerName">You</span>
+                    <span class="player-hp" id="playerHp">1500 HP</span>
+                </div>
+            </div>
+
+            <!-- Hand -->
+            <div class="hand-area" id="handArea">
+                <div class="hand-header">
+                    <span>Hand (<span id="handCount">0</span>)</span>
+                    <span class="phase-display" id="phaseDisplay">Phase: Start</span>
+                    <button class="btn btn-small" onclick="toggleHand()">Toggle</button>
+                </div>
+                <div class="hand-cards" id="handCards"></div>
+            </div>
+
+            <!-- Action Panel -->
+            <div class="action-panel">
+                <button class="btn btn-action" id="playButton" onclick="playSelectedCard()" disabled>Play</button>
+                <button class="btn btn-action" onclick="showHeroAbilityModal()">Hero Ability</button>
+                <button class="btn btn-action" id="attackButton" onclick="attackWithSelected()" disabled>Attack</button>
+                <button class="btn btn-primary" onclick="endTurn()">End Turn</button>
+            </div>
+        </div>
+
+        <!-- Modals -->
+        <div class="modal" id="trapTriggerModal" style="display: none;">
+            <div class="modal-content">
+                <h3>Trap Trigger Available</h3>
+                <p id="trapTriggerMessage"></p>
+                <div class="modal-actions">
+                    <button class="btn btn-primary" onclick="triggerTrap(true)">Yes</button>
+                    <button class="btn btn-secondary" onclick="triggerTrap(false)">No</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="playMonsterModal" style="display: none;">
+            <div class="modal-content">
+                <h3>Play Monster</h3>
+                <div id="playMonsterContent"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick="closeModal('playMonsterModal')">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="playSpellModal" style="display: none;">
+            <div class="modal-content">
+                <h3>Play Spell</h3>
+                <div id="playSpellContent"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick="closeModal('playSpellModal')">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="playTrapModal" style="display: none;">
+            <div class="modal-content">
+                <h3>Set Trap</h3>
+                <div id="playTrapContent"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick="closeModal('playTrapModal')">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="attackModal" style="display: none;">
+            <div class="modal-content">
+                <h3>Attack</h3>
+                <div id="attackContent"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick="closeModal('attackModal')">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal" id="tributeModal" style="display: none;">
+            <div class="modal-content">
+                <h3>Select Tributes</h3>
+                <p id="tributeMessage">Select monsters to tribute:</p>
+                <div id="tributeContent"></div>
+                <div class="modal-actions">
+                    <button class="btn btn-primary" onclick="confirmTributes()">Confirm</button>
+                    <button class="btn btn-secondary" onclick="closeModal('tributeModal')">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Log -->
+        <div class="log-panel" id="logPanel">
+            <div class="log-header">
+                <span>Game Log</span>
+                <button class="btn btn-small" onclick="showLastTurnSummary()">Last Turn</button>
+                <button class="btn btn-small" onclick="toggleLog()">Toggle</button>
+            </div>
+            <div class="log-content" id="logContent"></div>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay" id="loadingOverlay" style="display: none;">
+            <div class="spinner"></div>
+            <p>Processing...</p>
+        </div>
+    </div>
+
+    <script src="game.js"></script>
+</body>
+</html>
+

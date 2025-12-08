@@ -54,6 +54,12 @@ class CardInstance:
     # Effects from DB
     effect_tags: List[str] = field(default_factory=list)
     effect_params: dict = field(default_factory=dict)
+    
+    # Card description/flavor text
+    description: Optional[str] = None
+    art_asset_id: Optional[str] = None
+    flavor_text: Optional[str] = None
+    rules_text: Optional[str] = None
 
     def is_monster(self) -> bool:
         return self.card_type == CardType.MONSTER
@@ -89,6 +95,10 @@ class CardInstance:
             can_attack=False,
             effect_tags=card_def.get("effect_tags") or [],
             effect_params=card_def.get("effect_params") or {},
+            description=card_def.get("description") or card_def.get("rules_text") or None,
+            art_asset_id=card_def.get("art_asset_id") or None,
+            flavor_text=card_def.get("flavor_text") or None,
+            rules_text=card_def.get("rules_text") or None,
         )
 
 

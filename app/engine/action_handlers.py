@@ -81,6 +81,7 @@ def handle_play_spell(
     game_state["players"] = players
 
     # Build spell log entry
+    log = game_state.get("log") or []
     spell_log_entry: Dict[str, Any] = {
         "type": "PLAY_SPELL",
         "player": player_index,
@@ -89,8 +90,10 @@ def handle_play_spell(
         "effects": effect_result.log_events,
     }
     log.append(spell_log_entry)
+    game_state["log"] = log
 
     # Check lethal from non-combat effects
+    from app.main import _check_lethal_after_noncombat
     _check_lethal_after_noncombat(
         game_state=game_state,
         players=players,
@@ -104,6 +107,7 @@ def handle_activate_trap(
     trap_instance_id: str,
     target_player_index: Optional[int],
     target_monster_instance_id: Optional[str],
+    trigger_event: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Handle ACTIVATE_TRAP action."""
     players = game_state.get("players", {})
@@ -147,6 +151,7 @@ def handle_activate_trap(
         source_player=player_index,
         source_card=trap_card,
         targets=targets,
+        trigger_event=trigger_event,
     )
 
     effect_result = resolve_card_effects(ctx)
@@ -177,6 +182,7 @@ def handle_activate_trap(
     game_state["players"] = players
 
     # Build trap log entry
+    log = game_state.get("log") or []
     trap_log_entry: Dict[str, Any] = {
         "type": "ACTIVATE_TRAP",
         "player": player_index,
@@ -185,231 +191,13 @@ def handle_activate_trap(
         "effects": effect_result.log_events,
     }
     log.append(trap_log_entry)
+    game_state["log"] = log
 
+    # Check lethal from non-combat effects
+    from app.main import _check_lethal_after_noncombat
     _check_lethal_after_noncombat(
         game_state=game_state,
         players=players,
         log=log,
         reason="trap_effects",
     )
-```
-
-## 2. Fix parameter name compatibility in resolver
-
-The resolver expects different parameter names than what's currently in the DB. Update the resolver to support both:
-
-```python:app/engine/effects/resolver.py
-# Update handle_spell_buff_monster (around line 450):
-def handle_spell_buff_monster(
-    ctx: EffectContext, params: Dict[str, Any]
-) -> EffectResult:
-    ref = _get_monster_ref_from_targets(ctx)
-    if not ref:
-        return EffectResult(
-            log_events=[
-                {
-                    "type": "EFFECT_NO_TARGET",
-                    "reason": "MONSTER_NOT_FOUND",
-                    "card_code": ctx.source_card.get("card_code"),
-                }
-            ]
-        )
-
-    # Support both naming conventions
-    atk_inc = int(params.get("atk_increase") or params.get("amount_atk") or params.get("atk_delta", 0))
-    hp_inc = int(params.get("hp_increase") or params.get("amount_hp") or params.get("hp_delta", 0))
-
-    player_index, zone_index, card = ref
-    before_atk = card.get("atk", 0)
-    before_hp = card.get("hp", 0)
-    before_max_hp = card.get("max_hp") or before_hp
-
-    card["atk"] = before_atk + atk_inc
-    new_hp = before_hp + hp_inc
-    new_max_hp = before_max_hp + hp_inc
-    card["hp"] = _clamp_hp(new_hp, new_max_hp)
-    card["max_hp"] = new_max_hp  # Update max_hp for buffs
-
-    return EffectResult(
-        log_events=[
-            {
-                "type": "EFFECT_BUFF_MONSTER",
-                "player_index": player_index,
-                "zone_index": zone_index,
-                "atk_before": before_atk,
-                "atk_after": card["atk"],
-                "hp_before": before_hp,
-                "hp_after": card["hp"],
-                "max_hp_before": before_max_hp,
-                "max_hp_after": new_max_hp,
-                "card_instance_id": card.get("instance_id"),
-            }
-        ]
-    )
-
-# Update handle_spell_draw_cards (around line 415):
-def handle_spell_draw_cards(
-    ctx: EffectContext, params: Dict[str, Any]
-) -> EffectResult:
-    # Support both "count" and "amount"
-    amount = int(params.get("count") or params.get("amount", 0))
-    if amount <= 0:
-        return EffectResult()
-
-    player_index = ctx.targets.get("player")
-    if not isinstance(player_index, int):
-        player_index = ctx.source_player
-
-    gs_player = _get_player(ctx.game_state, player_index)
-    deck = gs_player.get("deck", [])
-    hand = gs_player.get("hand", [])
-
-    drawn: List[Dict[str, Any]] = []
-    for _ in range(amount):
-        if not deck:
-            break
-        card = deck.pop(0)
-        hand.append(card)
-        drawn.append(card)
-
-    return EffectResult(
-        log_events=[
-            {
-                "type": "EFFECT_DRAW_CARDS",
-                "player_index": player_index,
-                "amount": len(drawn),
-                "card_instance_ids": [c.get("instance_id") for c in drawn],
-            }
-        ]
-    )
-
-# Update handle_spell_apply_status (around line 406):
-def handle_spell_apply_status(
-    ctx: EffectContext, params: Dict[str, Any]
-) -> EffectResult:
-    # Support both "status" and "status_code"
-    status_code = params.get("status_code") or params.get("status")
-    duration_type = params.get("duration_type", "PERMANENT")
-    duration_value = params.get("duration_value")  # optional int
-    return _apply_status_to_monster(ctx, status_code, duration_type, duration_value)
-```
-
-## 3. Code cleanup suggestions
-
-### A. Extract helper functions
-
-Create a helper module `app/engine/actions.py` to reduce `main.py` size:
-
-```python:app/engine/actions.py
-"""Helper functions for battle actions that can be reused."""
-from typing import Dict, Any, List, Optional, Tuple
-
-def handle_destroyed_monsters(
-    game_state: Dict[str, Any],
-    destroyed_monsters: List[Tuple[int, int]],
-) -> None:
-    """Move destroyed monsters to graveyard."""
-    players = game_state.get("players", {})
-    for player_idx, zone_idx in destroyed_monsters:
-        pkey = str(player_idx)
-        player_state = players.get(pkey)
-        if not player_state:
-            continue
-        
-        monster_zones = player_state.get("monster_zones") or []
-        if zone_idx < len(monster_zones) and monster_zones[zone_idx] is not None:
-            destroyed_card = monster_zones[zone_idx]
-            graveyard = player_state.get("graveyard") or []
-            graveyard.append(destroyed_card)
-            monster_zones[zone_idx] = None
-            player_state["graveyard"] = graveyard
-            player_state["monster_zones"] = monster_zones
-```
-
-### B. Remove duplicate code
-
-The `_get_effects_from_card` function (line 219) is no longer needed since the resolver handles this internally.
-
-### C. Standardize status handling
-
-The resolver uses structured status objects `{"code": str, "duration_type": str, ...}`, but the current code uses simple strings. Update the resolver's `_apply_status_to_monster` to support both formats for backward compatibility:
-
-```python:app/engine/effects/resolver.py
-# In _apply_status_to_monster, support both formats:
-def _apply_status_to_monster(
-    ctx: EffectContext, status_code: str, duration_type: str, duration_value: Optional[int]
-) -> EffectResult:
-    # ... existing code ...
-    
-    # Support both old format (list of strings) and new format (list of objects)
-    statuses = card.get("statuses") or []
-    
-    # If statuses is a list of strings, convert to new format
-    if statuses and isinstance(statuses[0], str):
-        statuses = [{"code": s, "duration_type": "PERMANENT"} for s in statuses]
-        card["statuses"] = statuses
-    
-    status_entry = {
-        "code": status_code,
-        "duration_type": duration_type,
-    }
-    if duration_value is not None:
-        status_entry["duration_value"] = duration_value
-    
-    # Check if status already exists (by code)
-    if not any(s.get("code") == status_code for s in statuses):
-        statuses.append(status_entry)
-    
-    # ... rest of function ...
-```
-
-### D. Create a game state helper module
-
-Extract common game state operations:
-
-```python:app/engine/game_state_helpers.py
-"""Helper functions for manipulating serialized game state."""
-from typing import Dict, Any, Optional
-
-def get_player_state(game_state: Dict[str, Any], player_index: int) -> Dict[str, Any]:
-    """Get player state by index."""
-    return game_state.get("players", {}).get(str(player_index), {})
-
-def find_monster_by_instance_id(
-    game_state: Dict[str, Any],
-    instance_id: str,
-) -> Optional[Dict[str, Any]]:
-    """Find a monster by instance_id across all players."""
-    players = game_state.get("players", {})
-    for pkey, p_state in players.items():
-        monster_zones = p_state.get("monster_zones") or []
-        for idx, slot in enumerate(monster_zones):
-            if slot is not None and slot.get("instance_id") == instance_id:
-                return {
-                    "player_index": int(pkey),
-                    "zone_index": idx,
-                    "card": slot,
-                }
-    return None
-```
-
-### E. Split `battle_action` into smaller functions
-
-Break the large `battle_action` function into action-specific handlers:
-
-```python:app/engine/action_handlers.py
-<code_block_to_apply_changes_from>
-```
-
-## Summary
-
-1. Route `PLAY_SPELL` and `ACTIVATE_TRAP` through the resolver
-2. Update resolver parameter names for compatibility
-3. Extract helper functions to reduce duplication
-4. Remove unused code (`_get_effects_from_card`)
-5. Standardize status format handling
-6. Split `battle_action` into smaller, focused functions
-
-This aligns with the system rules: keyword-based resolution, no hardcoded effects, and easier extension via DB rows.
-
-Should I provide the complete refactored `main.py` with these changes integrated?
