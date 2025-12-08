@@ -313,19 +313,26 @@ def _apply_status_to_monster(
 
     player_index, zone_index, card = ref
 
+    # Support both old format (list of strings) and new format (list of objects)
+    statuses = card.get("statuses") or []
+    
+    # If statuses is a list of strings, convert to new format
+    if statuses and isinstance(statuses[0], str):
+        statuses = [{"code": s, "duration_type": "PERMANENT"} for s in statuses]
+        card["statuses"] = statuses
+    
     status_entry = {
         "code": status_code,
-        "duration_type": duration_type,  # e.g. "UNTIL_CONTROLLER_NEXT_TURN", "FIXED_TURNS", "PERMANENT"
+        "duration_type": duration_type,
     }
     if duration_value is not None:
         status_entry["duration_value"] = duration_value
-
-    statuses = card.get("statuses")
-    if statuses is None:
-        statuses = []
-        card["statuses"] = statuses
-
-    statuses.append(status_entry)
+    
+    # Check if status already exists (by code)
+    if not any(s.get("code") == status_code for s in statuses):
+        statuses.append(status_entry)
+    
+    card["statuses"] = statuses
 
     return EffectResult(
         log_events=[
@@ -406,7 +413,8 @@ def handle_spell_heal_monster(
 def handle_spell_apply_status(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
-    status_code = params.get("status_code")
+    # Support both "status" and "status_code"
+    status_code = params.get("status_code") or params.get("status")
     duration_type = params.get("duration_type", "PERMANENT")
     duration_value = params.get("duration_value")  # optional int
     return _apply_status_to_monster(ctx, status_code, duration_type, duration_value)
@@ -415,7 +423,8 @@ def handle_spell_apply_status(
 def handle_spell_draw_cards(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
-    amount = int(params.get("amount", 0))
+    # Support both "count" and "amount"
+    amount = int(params.get("count") or params.get("amount", 0))
     if amount <= 0:
         return EffectResult()
 
@@ -462,19 +471,20 @@ def handle_spell_buff_monster(
             ]
         )
 
-    atk_inc = int(params.get("atk_increase", 0))
-    hp_inc = int(params.get("hp_increase", 0))
+    # Support both naming conventions
+    atk_inc = int(params.get("atk_increase") or params.get("amount_atk") or params.get("atk_delta", 0))
+    hp_inc = int(params.get("hp_increase") or params.get("amount_hp") or params.get("hp_delta", 0))
 
     player_index, zone_index, card = ref
     before_atk = card.get("atk", 0)
     before_hp = card.get("hp", 0)
-    before_max_hp = card.get("max_hp")
+    before_max_hp = card.get("max_hp") or before_hp
 
     card["atk"] = before_atk + atk_inc
     new_hp = before_hp + hp_inc
-    card["hp"] = _clamp_hp(new_hp, before_max_hp)
-
-    # Optionally, you could also increase max_hp here if desired.
+    new_max_hp = before_max_hp + hp_inc
+    card["hp"] = _clamp_hp(new_hp, new_max_hp)
+    card["max_hp"] = new_max_hp  # Update max_hp for buffs
 
     return EffectResult(
         log_events=[
@@ -486,6 +496,8 @@ def handle_spell_buff_monster(
                 "atk_after": card["atk"],
                 "hp_before": before_hp,
                 "hp_after": card["hp"],
+                "max_hp_before": before_max_hp,
+                "max_hp_after": new_max_hp,
                 "card_instance_id": card.get("instance_id"),
             }
         ]
