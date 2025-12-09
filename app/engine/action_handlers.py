@@ -108,7 +108,7 @@ def handle_activate_trap(
     target_player_index: Optional[int],
     target_monster_instance_id: Optional[str],
     trigger_event: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> EffectResult:
     """Handle ACTIVATE_TRAP action."""
     players = game_state.get("players", {})
     pkey = str(player_index)
@@ -201,3 +201,6 @@ def handle_activate_trap(
         log=log,
         reason="trap_effects",
     )
+    
+    # Return the effect result so caller can check if spell was cancelled
+    return effect_result

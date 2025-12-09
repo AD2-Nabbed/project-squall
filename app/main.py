@@ -1042,12 +1042,13 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                 
                 # Activate the trap directly
                 from app.engine.action_handlers import handle_activate_trap
-                handle_activate_trap(
+                trap_effect_result = handle_activate_trap(
                     game_state=game_state,
                     player_index=def_player_idx,
                     trap_instance_id=trap_to_trigger["trap_instance_id"],
                     target_player_index=payload.player_index,
                     target_monster_instance_id=ps.target_monster_instance_id,
+                    trigger_event={"type": "SPELL_CAST", "card_name": card.get("name"), "spell_card": card, "spell_target": ps.target_monster_instance_id, "spell_caster": payload.player_index},
                 )
                 
                 # Add trap trigger log
@@ -1057,7 +1058,106 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     "trap_instance_id": trap_to_trigger["trap_instance_id"],
                     "card_name": trap_to_trigger.get("card_name"),
                     "trigger_type": "ON_SPELL_CAST",
+                    "effects": trap_effect_result.log_events,
+                    "cancelled_action": trap_effect_result.cancelled,
                 })
+                
+                # Check if trap cancelled the spell
+                if trap_effect_result.cancelled:
+                    # Spell was countered - log it and check for reflection
+                    log.append({
+                        "type": "ACTION_CANCELLED",
+                        "reason": "trap_counter",
+                        "original_action": "PLAY_SPELL",
+                        "spell_name": card.get("name"),
+                    })
+                    
+                    # Check if trap should reflect the spell back
+                    reflect_spell = False
+                    for eff in trap_effect_result.log_events:
+                        if eff.get("type") == "EFFECT_COUNTER_AND_REFLECT_SPELL" or eff.get("reflect_spell"):
+                            reflect_spell = True
+                            break
+                    
+                    if reflect_spell:
+                        # Reflect spell back to caster's side
+                        # Find a target on the caster's side (one of their monsters)
+                        caster_state = players.get(pkey)
+                        caster_monsters = caster_state.get("monster_zones") or []
+                        valid_targets = [m for m in caster_monsters if m is not None and m.get("hp", 0) > 0]
+                        
+                        if valid_targets:
+                            # Auto-select first valid target for reflection
+                            reflected_target = valid_targets[0]
+                            reflected_target_instance_id = reflected_target.get("instance_id")
+                            
+                            # Apply the spell effect to the reflected target
+                            found = find_monster_by_instance_id(game_state, reflected_target_instance_id)
+                            if found:
+                                reflected_targets = {
+                                    "monster": {
+                                        "player_index": found["player_index"],
+                                        "zone_index": found["zone_index"],
+                                    }
+                                }
+                                
+                                # Create effect context for reflected spell
+                                reflected_ctx = EffectContext(
+                                    game_state=game_state,
+                                    source_player=def_player_idx,  # Trap controller casts the reflected spell
+                                    source_card=card,  # Use the original spell card
+                                    targets=reflected_targets,
+                                )
+                                
+                                reflected_effect_result = resolve_card_effects(reflected_ctx)
+                                _handle_destroyed_monsters(game_state, reflected_effect_result.destroyed_monsters)
+                                
+                                # Log the reflection
+                                log.append({
+                                    "type": "SPELL_REFLECTED",
+                                    "original_caster": payload.player_index,
+                                    "reflected_by": def_player_idx,
+                                    "spell_name": card.get("name"),
+                                    "target_monster": reflected_target.get("name"),
+                                    "effects": reflected_effect_result.log_events,
+                                })
+                                
+                                # Ensure monster zones are updated
+                                monster_zones = caster_state.get("monster_zones") or []
+                                caster_state["monster_zones"] = monster_zones
+                                players[pkey] = caster_state
+                                game_state["players"] = players
+                                
+                                # Check lethal after reflected spell
+                                _check_lethal_after_noncombat(
+                                    game_state=game_state,
+                                    players=players,
+                                    log=log,
+                                    reason="reflected_spell_effects",
+                                )
+                    
+                    # Move spell to graveyard (it was countered, not resolved)
+                    graveyard = p_state.get("graveyard") or []
+                    graveyard.append(card)
+                    p_state["graveyard"] = graveyard
+                    players[pkey] = p_state
+                    game_state["players"] = players
+                    
+                    # Increment spell/trap counter (spell was played, even if countered)
+                    p_turn["spells_traps"] = 1
+                    turn_state[pkey] = p_turn
+                    
+                    # Don't resolve the original spell - it was countered
+                    # Save and return
+                    supabase.table("matches").update({
+                        "serialized_game_state": game_state,
+                        "status": game_state.get("status", match_row.get("status")),
+                    }).eq("id", payload.match_id).execute()
+                    
+                    return {
+                        "match_id": payload.match_id,
+                        "game_state": game_state,
+                    }
                 
                 # Check lethal after trap effects
                 _check_lethal_after_noncombat(
@@ -1067,7 +1167,7 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     reason="trap_effects",
                 )
                 
-                # Continue with spell resolution (trap may have cancelled it, but that's handled in the trap effect)
+                # Continue with spell resolution (trap didn't cancel it)
             else:
                 # Player trap - return for player decision
                 return {
@@ -1081,7 +1181,13 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                         "player_index": payload.player_index,
                     },
                     "trigger_type": "ON_SPELL_CAST",
-                    "trigger_event": {"type": "SPELL_CAST", "card_name": card.get("name")},
+                    "trigger_event": {
+                        "type": "SPELL_CAST",
+                        "card_name": card.get("name"),
+                        "spell_card": card,
+                        "spell_target": ps.target_monster_instance_id,
+                        "spell_caster": payload.player_index,
+                    },
                 }
 
         # Capture target monster info BEFORE spell effect (for logging)
@@ -1453,12 +1559,19 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                 
                 # Activate the trap directly
                 from app.engine.action_handlers import handle_activate_trap
-                handle_activate_trap(
+                trap_effect_result = handle_activate_trap(
                     game_state=game_state,
                     player_index=def_player_idx,
                     trap_instance_id=trap_to_trigger["trap_instance_id"],
                     target_player_index=atk_player_idx,
                     target_monster_instance_id=am.attacker_instance_id,
+                    trigger_event={
+                        "type": "ATTACK_MONSTER",
+                        "attacker_instance_id": am.attacker_instance_id,
+                        "attacker_atk": attacker.get("atk", 0),
+                        "attacking_player": atk_player_idx,
+                        "defending_player": def_player_idx,
+                    },
                 )
                 
                 # Add trap trigger log
@@ -1468,6 +1581,8 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     "trap_instance_id": trap_to_trigger["trap_instance_id"],
                     "card_name": trap_to_trigger.get("card_name"),
                     "trigger_type": "ON_ATTACK_DECLARED",
+                    "effects": trap_effect_result.log_events,
+                    "cancelled_action": trap_effect_result.cancelled,
                 })
                 
                 # Check lethal after trap effects
@@ -1478,11 +1593,47 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     reason="trap_effects",
                 )
                 
+                # If trap cancelled the attack, don't proceed
+                if trap_effect_result.cancelled:
+                    log.append({
+                        "type": "ACTION_CANCELLED",
+                        "reason": "trap_negate_attack",
+                        "original_action": "ATTACK_MONSTER",
+                    })
+                    # Mark attacker as having used its attack (even though it was negated)
+                    attacker["can_attack"] = False
+                    atk_mz[attacker_zone_index] = attacker
+                    atk_state["monster_zones"] = atk_mz
+                    players[atk_pkey] = atk_state
+                    game_state["players"] = players
+                    supabase.table("matches").update({
+                        "serialized_game_state": game_state,
+                    }).eq("id", payload.match_id).execute()
+                    return {
+                        "match_id": payload.match_id,
+                        "game_state": game_state,
+                    }
+                
                 # Continue with attack after trap resolves
                 # (trap may have destroyed the attacker, so check again)
-                attacker = find_monster_by_instance_id(game_state, am.attacker_instance_id)
-                if not attacker:
+                # Re-fetch both attacker and defender to get updated HP values
+                attacker_found = find_monster_by_instance_id(game_state, am.attacker_instance_id)
+                if not attacker_found:
                     # Attacker was destroyed by trap
+                    return {
+                        "match_id": payload.match_id,
+                        "game_state": game_state,
+                    }
+                # Update attacker reference to use the updated card from game state
+                attacker = attacker_found["card"]
+                attacker_zone_index = attacker_found["zone_index"]
+                # Also re-fetch defender in case trap affected it
+                defender_found = find_monster_by_instance_id(game_state, am.defender_instance_id)
+                if defender_found:
+                    defender = defender_found["card"]
+                    defender_zone_index = defender_found["zone_index"]
+                else:
+                    # Defender was destroyed by trap - attack cannot proceed
                     return {
                         "match_id": payload.match_id,
                         "game_state": game_state,
@@ -1512,7 +1663,7 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
         # Flip defender face-up if needed
         defender["face_down"] = False
 
-        # Snapshot monster HP before combat
+        # Snapshot monster HP before combat (use current HP after any trap effects)
         attacker_hp_before = attacker.get("hp", 0)
         defender_hp_before = defender.get("hp", 0)
         atk_value = max(attacker.get("atk", 0), 0)
@@ -1561,41 +1712,68 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                 },
             )
             if available_traps:
-                # Auto-trigger player's trap (always say yes for now)
-                trap_to_trigger = available_traps[0]
-                print(f"Trap triggered: {trap_to_trigger.get('card_name')} preventing destruction")
-                
-                from app.engine.action_handlers import handle_activate_trap
-                # For prevent destruction traps, we need to pass the trigger_event with monster info
-                # The trap handler will use this to find the target monster
-                trigger_event_for_trap = {
-                    "type": "MONSTER_WOULD_BE_DESTROYED",
-                    "monster_instance_id": am.defender_instance_id,
-                    "player_index": def_player_idx,
-                    "zone_index": defender_zone_index,
-                }
-                handle_activate_trap(
-                    game_state=game_state,
-                    player_index=def_player_idx,
-                    trap_instance_id=trap_to_trigger["trap_instance_id"],
-                    target_player_index=def_player_idx,
-                    target_monster_instance_id=am.defender_instance_id,
-                    trigger_event=trigger_event_for_trap,
-                )
-                
-                log.append({
-                    "type": "TRAP_TRIGGERED",
-                    "player": def_player_idx,
-                    "trap_instance_id": trap_to_trigger["trap_instance_id"],
-                    "card_name": trap_to_trigger.get("card_name"),
-                    "trigger_type": "ON_ALLY_MONSTER_WOULD_BE_DESTROYED",
-                })
-                
-                # Re-check HP after trap (trap may have set HP to 1)
-                defender = find_monster_by_instance_id(game_state, am.defender_instance_id)
-                if defender and defender.get("hp", 0) > 0:
-                    defender_died = False
-                    defender_hp_after = defender.get("hp", 0)
+                # Check if this is PVE and the trap belongs to AI - auto-trigger it
+                match_mode = match_row.get("mode", "PVE")
+                ai_player_index = 2  # NPC is always player 2 in PVE
+                if match_mode == "PVE" and def_player_idx == ai_player_index:
+                    # Auto-trigger AI trap (always say yes)
+                    trap_to_trigger = available_traps[0]
+                    print(f"AI auto-triggering trap: {trap_to_trigger.get('card_name')} preventing destruction")
+                    
+                    from app.engine.action_handlers import handle_activate_trap
+                    # For prevent destruction traps, we need to pass the trigger_event with monster info
+                    # The trap handler will use this to find the target monster
+                    trigger_event_for_trap = {
+                        "type": "MONSTER_WOULD_BE_DESTROYED",
+                        "monster_instance_id": am.defender_instance_id,
+                        "player_index": def_player_idx,
+                        "zone_index": defender_zone_index,
+                    }
+                    handle_activate_trap(
+                        game_state=game_state,
+                        player_index=def_player_idx,
+                        trap_instance_id=trap_to_trigger["trap_instance_id"],
+                        target_player_index=def_player_idx,
+                        target_monster_instance_id=am.defender_instance_id,
+                        trigger_event=trigger_event_for_trap,
+                    )
+                    
+                    log.append({
+                        "type": "TRAP_TRIGGERED",
+                        "player": def_player_idx,
+                        "trap_instance_id": trap_to_trigger["trap_instance_id"],
+                        "card_name": trap_to_trigger.get("card_name"),
+                        "trigger_type": "ON_ALLY_MONSTER_WOULD_BE_DESTROYED",
+                    })
+                    
+                    # Re-check HP after trap (trap may have set HP to 1)
+                    defender_found = find_monster_by_instance_id(game_state, am.defender_instance_id)
+                    if defender_found and defender_found["card"].get("hp", 0) > 0:
+                        defender_died = False
+                        defender_hp_after = defender_found["card"].get("hp", 0)
+                else:
+                    # Player trap - return for player decision
+                    return {
+                        "match_id": payload.match_id,
+                        "game_state": game_state,
+                        "trap_triggers_available": available_traps,
+                        "trigger_player_index": def_player_idx,
+                        "pending_action": {
+                            "action": "ATTACK_MONSTER",
+                            "attack_monster": {
+                                "attacker_instance_id": am.attacker_instance_id,
+                                "defender_instance_id": am.defender_instance_id,
+                            },
+                            "player_index": payload.player_index,
+                        },
+                        "trigger_type": "ON_ALLY_MONSTER_WOULD_BE_DESTROYED",
+                        "trigger_event": {
+                            "type": "MONSTER_WOULD_BE_DESTROYED",
+                            "monster_instance_id": am.defender_instance_id,
+                            "player_index": def_player_idx,
+                            "zone_index": defender_zone_index,
+                        },
+                    }
         
         # Check attacker's traps
         if attacker_died:
@@ -1611,40 +1789,67 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                 },
             )
             if available_traps:
-                # Auto-trigger player's trap (always say yes for now)
-                trap_to_trigger = available_traps[0]
-                print(f"Trap triggered: {trap_to_trigger.get('card_name')} preventing destruction")
-                
-                from app.engine.action_handlers import handle_activate_trap
-                # For prevent destruction traps, we need to pass the trigger_event with monster info
-                trigger_event_for_trap = {
-                    "type": "MONSTER_WOULD_BE_DESTROYED",
-                    "monster_instance_id": am.attacker_instance_id,
-                    "player_index": atk_player_idx,
-                    "zone_index": attacker_zone_index,
-                }
-                handle_activate_trap(
-                    game_state=game_state,
-                    player_index=atk_player_idx,
-                    trap_instance_id=trap_to_trigger["trap_instance_id"],
-                    target_player_index=atk_player_idx,
-                    target_monster_instance_id=am.attacker_instance_id,
-                    trigger_event=trigger_event_for_trap,
-                )
-                
-                log.append({
-                    "type": "TRAP_TRIGGERED",
-                    "player": atk_player_idx,
-                    "trap_instance_id": trap_to_trigger["trap_instance_id"],
-                    "card_name": trap_to_trigger.get("card_name"),
-                    "trigger_type": "ON_ALLY_MONSTER_WOULD_BE_DESTROYED",
-                })
-                
-                # Re-check HP after trap (trap may have set HP to 1)
-                attacker = find_monster_by_instance_id(game_state, am.attacker_instance_id)
-                if attacker and attacker.get("hp", 0) > 0:
-                    attacker_died = False
-                    attacker_hp_after = attacker.get("hp", 0)
+                # Check if this is PVE and the trap belongs to AI - auto-trigger it
+                match_mode = match_row.get("mode", "PVE")
+                ai_player_index = 2  # NPC is always player 2 in PVE
+                if match_mode == "PVE" and atk_player_idx == ai_player_index:
+                    # Auto-trigger AI trap (always say yes)
+                    trap_to_trigger = available_traps[0]
+                    print(f"AI auto-triggering trap: {trap_to_trigger.get('card_name')} preventing destruction")
+                    
+                    from app.engine.action_handlers import handle_activate_trap
+                    # For prevent destruction traps, we need to pass the trigger_event with monster info
+                    trigger_event_for_trap = {
+                        "type": "MONSTER_WOULD_BE_DESTROYED",
+                        "monster_instance_id": am.attacker_instance_id,
+                        "player_index": atk_player_idx,
+                        "zone_index": attacker_zone_index,
+                    }
+                    handle_activate_trap(
+                        game_state=game_state,
+                        player_index=atk_player_idx,
+                        trap_instance_id=trap_to_trigger["trap_instance_id"],
+                        target_player_index=atk_player_idx,
+                        target_monster_instance_id=am.attacker_instance_id,
+                        trigger_event=trigger_event_for_trap,
+                    )
+                    
+                    log.append({
+                        "type": "TRAP_TRIGGERED",
+                        "player": atk_player_idx,
+                        "trap_instance_id": trap_to_trigger["trap_instance_id"],
+                        "card_name": trap_to_trigger.get("card_name"),
+                        "trigger_type": "ON_ALLY_MONSTER_WOULD_BE_DESTROYED",
+                    })
+                    
+                    # Re-check HP after trap (trap may have set HP to 1)
+                    attacker_found = find_monster_by_instance_id(game_state, am.attacker_instance_id)
+                    if attacker_found and attacker_found["card"].get("hp", 0) > 0:
+                        attacker_died = False
+                        attacker_hp_after = attacker_found["card"].get("hp", 0)
+                else:
+                    # Player trap - return for player decision
+                    return {
+                        "match_id": payload.match_id,
+                        "game_state": game_state,
+                        "trap_triggers_available": available_traps,
+                        "trigger_player_index": atk_player_idx,
+                        "pending_action": {
+                            "action": "ATTACK_MONSTER",
+                            "attack_monster": {
+                                "attacker_instance_id": am.attacker_instance_id,
+                                "defender_instance_id": am.defender_instance_id,
+                            },
+                            "player_index": payload.player_index,
+                        },
+                        "trigger_type": "ON_ALLY_MONSTER_WOULD_BE_DESTROYED",
+                        "trigger_event": {
+                            "type": "MONSTER_WOULD_BE_DESTROYED",
+                            "monster_instance_id": am.attacker_instance_id,
+                            "player_index": atk_player_idx,
+                            "zone_index": attacker_zone_index,
+                        },
+                    }
 
         # Move dead defender to graveyard
         if defender_died:
@@ -1822,15 +2027,18 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     reason="trap_effects",
                 )
                 
-                # Continue with attack after trap resolves
-                # (trap may have destroyed the attacker, so check again)
-                attacker = find_monster_by_instance_id(game_state, ap.attacker_instance_id)
-                if not attacker:
+                # Check if trap cancelled the attack
+                # (trap may have destroyed the attacker or negated the attack)
+                attacker_found = find_monster_by_instance_id(game_state, ap.attacker_instance_id)
+                if not attacker_found:
                     # Attacker was destroyed by trap
                     return {
                         "match_id": payload.match_id,
                         "game_state": game_state,
                     }
+                # Update attacker reference
+                attacker = attacker_found["card"]
+                attacker_zone_index = attacker_found["zone_index"]
             else:
                 # Player trap - return for player decision
                 return {
@@ -2056,7 +2264,7 @@ def _get_available_trap_triggers(
                 spell_trigger_patterns = [
                     "ON_SPELL_CAST", "ON_CAST_SPELL", "ON_ENEMY_SPELL", 
                     "ON_OPPONENT_SPELL", "TRAP_ON_SPELL", "TRAP_TRIGGER_ON_OPPONENT_SPELL",
-                    "TRAP_CANCEL_SPELL", "SPELL_COUNTER_SPELL"
+                    "TRAP_CANCEL_SPELL", "SPELL_COUNTER_SPELL", "TRAP_COUNTER_SPELL"
                 ]
                 if any(t in spell_trigger_patterns for t in all_triggers):
                     matches = True
@@ -2320,6 +2528,83 @@ def trigger_trap(payload: TriggerTrapRequest) -> Dict[str, Any]:
             "reason": "trap_counter",
             "original_action": payload.pending_action,
         })
+        
+        # Check if trap should reflect the spell back
+        reflect_spell = False
+        for eff in effect_result.log_events:
+            if eff.get("type") == "EFFECT_COUNTER_AND_REFLECT_SPELL" or eff.get("reflect_spell"):
+                reflect_spell = True
+                break
+        
+        if reflect_spell and payload.pending_action and payload.pending_action.get("action") == "PLAY_SPELL":
+            # Reflect spell back to caster's side
+            pending_spell = payload.pending_action.get("play_spell", {})
+            spell_caster = payload.pending_action.get("player_index")
+            spell_target = pending_spell.get("target_monster_instance_id")
+            
+            # Find the original spell card from the trigger_event or reconstruct it
+            # For now, we'll need to get the spell info from trigger_event
+            trigger_event = payload.trigger_event or {}
+            spell_card = trigger_event.get("spell_card")
+            
+            if spell_card and spell_caster:
+                # Find a target on the caster's side (one of their monsters)
+                caster_pkey = str(spell_caster)
+                caster_state = players.get(caster_pkey)
+                if caster_state:
+                    caster_monsters = caster_state.get("monster_zones") or []
+                    valid_targets = [m for m in caster_monsters if m is not None and m.get("hp", 0) > 0]
+                    
+                    if valid_targets:
+                        # Auto-select first valid target for reflection
+                        reflected_target = valid_targets[0]
+                        reflected_target_instance_id = reflected_target.get("instance_id")
+                        
+                        # Apply the spell effect to the reflected target
+                        found = find_monster_by_instance_id(game_state, reflected_target_instance_id)
+                        if found:
+                            reflected_targets = {
+                                "monster": {
+                                    "player_index": found["player_index"],
+                                    "zone_index": found["zone_index"],
+                                }
+                            }
+                            
+                            # Create effect context for reflected spell
+                            reflected_ctx = EffectContext(
+                                game_state=game_state,
+                                source_player=payload.player_index,  # Trap controller casts the reflected spell
+                                source_card=spell_card,  # Use the original spell card
+                                targets=reflected_targets,
+                            )
+                            
+                            reflected_effect_result = resolve_card_effects(reflected_ctx)
+                            _handle_destroyed_monsters(game_state, reflected_effect_result.destroyed_monsters)
+                            
+                            # Ensure monster zones are updated
+                            monster_zones = caster_state.get("monster_zones") or []
+                            caster_state["monster_zones"] = monster_zones
+                            players[caster_pkey] = caster_state
+                            game_state["players"] = players
+                            
+                            # Log the reflection
+                            log.append({
+                                "type": "SPELL_REFLECTED",
+                                "original_caster": spell_caster,
+                                "reflected_by": payload.player_index,
+                                "spell_name": spell_card.get("name"),
+                                "target_monster": reflected_target.get("name"),
+                                "effects": reflected_effect_result.log_events,
+                            })
+                            
+                            # Check lethal after reflected spell
+                            _check_lethal_after_noncombat(
+                                game_state=game_state,
+                                players=players,
+                                log=log,
+                                reason="reflected_spell_effects",
+                            )
+    
     # Save state
     supabase.table("matches").update({
         "serialized_game_state": game_state,

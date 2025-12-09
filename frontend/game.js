@@ -382,10 +382,19 @@ function updateGameBoard() {
         }
     }
     if (selectedBoardMonster) {
-        // Check if selected monster is still on board
-        const stillOnBoard = player.monster_zones.some(m => m && m.instance_id === selectedBoardMonster.instance_id);
-        if (!stillOnBoard) {
+        // Check if selected monster is still on board and update its zone_index
+        const currentMonster = player.monster_zones.find(m => m && m.instance_id === selectedBoardMonster.instance_id);
+        if (!currentMonster) {
+            // Monster destroyed - clear selection
             selectedBoardMonster = null;
+        } else {
+            // Monster still exists - update zone_index and monster data to match current state
+            const currentZoneIndex = player.monster_zones.findIndex(m => m && m.instance_id === selectedBoardMonster.instance_id);
+            if (currentZoneIndex !== -1) {
+                selectedBoardMonster = { ...currentMonster, zone_index: currentZoneIndex };
+            } else {
+                selectedBoardMonster = null;
+            }
         }
     }
     selectedTarget = null;
@@ -921,6 +930,55 @@ function formatLogEntry(entry) {
         }
         return `Player ${entry.player} summoned ${entry.card_name || 'a hero'}${statsText}`;
     }
+    if (entry.type === 'ACTION_CANCELLED') {
+        if (entry.original_action && entry.original_action.action === 'PLAY_SPELL') {
+            const spellName = entry.original_action.play_spell?.card_name || 'a spell';
+            return `Spell ${spellName} was countered and negated`;
+        }
+        return `Action was cancelled: ${entry.reason || 'unknown'}`;
+    }
+    if (entry.type === 'SPELL_REFLECTED') {
+        let msg = `Spell ${entry.spell_name || 'a spell'} was reflected by Player ${entry.reflected_by}`;
+        if (entry.target_monster) {
+            msg += ` → Hit ${entry.target_monster}`;
+        }
+        if (entry.effects && entry.effects.length > 0) {
+            const effectMsgs = [];
+            entry.effects.forEach(eff => {
+                if (eff.type === 'EFFECT_DAMAGE_MONSTER') {
+                    effectMsgs.push(`Dealt ${eff.amount} damage`);
+                } else if (eff.type === 'EFFECT_DAMAGE_PLAYER') {
+                    effectMsgs.push(`Dealt ${eff.amount} damage to Player ${eff.player_index}`);
+                }
+            });
+            if (effectMsgs.length > 0) {
+                msg += ` → ${effectMsgs.join(', ')}`;
+            }
+        }
+        return msg;
+    }
+    if (entry.type === 'TRAP_TRIGGERED') {
+        let msg = `Player ${entry.player} triggered ${entry.card_name || 'a trap'}`;
+        if (entry.cancelled_action) {
+            msg += ' → Countered and negated the action';
+        }
+        if (entry.effects && entry.effects.length > 0) {
+            const effectMsgs = [];
+            entry.effects.forEach(eff => {
+                if (eff.type === 'EFFECT_COUNTER_SPELL' || eff.type === 'EFFECT_COUNTER_AND_REFLECT_SPELL') {
+                    if (eff.reflect_spell) {
+                        effectMsgs.push('Countered and reflected spell');
+                    } else {
+                        effectMsgs.push('Countered spell');
+                    }
+                }
+            });
+            if (effectMsgs.length > 0) {
+                msg += ` → ${effectMsgs.join(', ')}`;
+            }
+        }
+        return msg;
+    }
     return JSON.stringify(entry);
 }
 
@@ -945,7 +1003,14 @@ function selectBoardMonster(monster, zoneIndex) {
     if (selectedBoardMonster && selectedBoardMonster.instance_id === monster.instance_id) {
         selectedBoardMonster = null;
     } else {
-        selectedBoardMonster = { ...monster, zone_index: zoneIndex };
+        // Always find the current zone index from game state to ensure accuracy
+        const player = currentGameState.players[currentPlayerIndex];
+        const currentZoneIndex = player.monster_zones.findIndex(m => m && m.instance_id === monster.instance_id);
+        if (currentZoneIndex === -1) {
+            // Monster not found - don't select
+            return;
+        }
+        selectedBoardMonster = { ...monster, zone_index: currentZoneIndex };
         // Clear hand card selection when selecting board monster
         selectedCard = null;
     }
@@ -1049,8 +1114,16 @@ async function attackWithSelected() {
         return;
     }
     
-    // Update selectedBoardMonster with latest data
-    selectedBoardMonster = { ...currentMonster, zone_index: selectedBoardMonster.zone_index };
+    // Update selectedBoardMonster with latest data - find the correct zone_index from current game state
+    const currentZoneIndex = player.monster_zones.findIndex(m => m && m.instance_id === currentMonster.instance_id);
+    if (currentZoneIndex === -1) {
+        // Monster not found - clear selection
+        selectedBoardMonster = null;
+        updateActionButtons();
+        updateZones('player', player);
+        return;
+    }
+    selectedBoardMonster = { ...currentMonster, zone_index: currentZoneIndex };
     
     const opponent = currentGameState.players[currentPlayerIndex === 1 ? 2 : 1];
     const opponentMonsters = opponent.monster_zones.filter(m => m !== null);

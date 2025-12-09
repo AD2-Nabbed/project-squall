@@ -94,14 +94,19 @@ def resolve_card_effects(
         if not keyword:
             continue
 
-        handler = KEYWORD_HANDLERS.get(keyword)
+        # Normalize keyword (uppercase, strip whitespace) for case-insensitive lookup
+        keyword_normalized = keyword.upper().strip() if keyword else ""
+        # Try normalized keyword first, then original as fallback
+        handler = KEYWORD_HANDLERS.get(keyword_normalized) or KEYWORD_HANDLERS.get(keyword)
         if not handler:
             # Unknown keyword – safe no-op, but log it for debugging.
             result.log_events.append(
                 {
                     "type": "EFFECT_UNKNOWN_KEYWORD",
                     "keyword": keyword,
+                    "keyword_normalized": keyword_normalized,
                     "card_code": ctx.source_card.get("card_code"),
+                    "available_handlers": list(KEYWORD_HANDLERS.keys())[:10],  # First 10 for debugging
                 }
             )
             continue
@@ -624,22 +629,32 @@ def handle_spell_counter_spell(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
     """
-    Simple model: mark the chain as cancelled.
+    Counter spell: mark the chain as cancelled.
+    By default, reflects the spell back to the caster's side unless reflect_spell is False.
 
     The action layer should:
-      1. Resolve the trap that uses SPELL_COUNTER_SPELL.
+      1. Resolve the trap that uses SPELL_COUNTER_SPELL or TRAP_COUNTER_SPELL.
       2. If the returned EffectResult.cancelled is True, do NOT apply the
          original spell's effects and instead log that it was countered.
+      3. If reflect_spell is True (default), the spell should be reflected back to the caster.
     """
-    return EffectResult(
+    # Default to reflecting spells unless explicitly disabled
+    reflect_spell = params.get("reflect_spell", True)
+    if "reflect_spell" not in params and "reflect" in params:
+        reflect_spell = params.get("reflect", True)
+    
+    result = EffectResult(
         cancelled=True,
         log_events=[
             {
-                "type": "EFFECT_COUNTER_SPELL",
+                "type": "EFFECT_COUNTER_AND_REFLECT_SPELL" if reflect_spell else "EFFECT_COUNTER_SPELL",
                 "trap_card_instance_id": ctx.source_card.get("instance_id"),
+                "reflect_spell": reflect_spell,
             }
         ],
     )
+    
+    return result
 
 
 def handle_trap_reflect_damage(
@@ -725,6 +740,97 @@ def handle_spell_duplicate_incoming_status(
     return result
 
 
+def handle_trap_negate_attack(
+    ctx: EffectContext, params: Dict[str, Any]
+) -> EffectResult:
+    """
+    Negates an attack and optionally reflects damage back to the attacker.
+    
+    The action layer should:
+      - Call this when a trap with ON_ATTACK_DECLARED is triggered.
+      - The trigger_event should contain attacker_instance_id, attacker_atk, etc.
+      - This handler will cancel the attack and optionally deal damage to the attacker.
+    """
+    trigger_event = ctx.trigger_event or {}
+    attacker_instance_id = trigger_event.get("attacker_instance_id")
+    
+    if not attacker_instance_id:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "NO_ATTACKER",
+                    "card_code": ctx.source_card.get("card_code"),
+                }
+            ]
+        )
+    
+    # Find attacker
+    from app.engine.game_state_helpers import find_monster_by_instance_id
+    found = find_monster_by_instance_id(ctx.game_state, attacker_instance_id)
+    if not found:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "ATTACKER_NOT_FOUND",
+                    "card_code": ctx.source_card.get("card_code"),
+                }
+            ]
+        )
+    
+    attacker = found["card"]
+    attacker_player_index = found["player_index"]
+    attacker_zone_index = found["zone_index"]
+    
+    # Get attacker's ATK for reflection
+    attacker_atk = trigger_event.get("attacker_atk") or attacker.get("atk", 0)
+    
+    # Check if we should reflect damage (default: yes, deal attacker's ATK as damage)
+    reflect_damage = params.get("reflect_damage", True)
+    damage_amount = params.get("damage_amount")
+    
+    if reflect_damage:
+        # Default to dealing attacker's ATK as damage, or use specified amount
+        damage_to_deal = int(damage_amount) if damage_amount is not None else int(attacker_atk)
+        
+        hp_before = attacker.get("hp", 0)
+        hp_after = max(0, hp_before - damage_to_deal)
+        attacker["hp"] = hp_after
+        
+        return EffectResult(
+            cancelled=True,  # Cancel the attack
+            log_events=[
+                {
+                    "type": "EFFECT_NEGATE_ATTACK",
+                    "trap_card_instance_id": ctx.source_card.get("instance_id"),
+                    "attacker_instance_id": attacker_instance_id,
+                },
+                {
+                    "type": "EFFECT_DAMAGE_MONSTER",
+                    "player_index": attacker_player_index,
+                    "zone_index": attacker_zone_index,
+                    "amount": damage_to_deal,
+                    "hp_before": hp_before,
+                    "hp_after": hp_after,
+                    "card_instance_id": attacker_instance_id,
+                }
+            ]
+        )
+    else:
+        # Just negate, no damage
+        return EffectResult(
+            cancelled=True,
+            log_events=[
+                {
+                    "type": "EFFECT_NEGATE_ATTACK",
+                    "trap_card_instance_id": ctx.source_card.get("instance_id"),
+                    "attacker_instance_id": attacker_instance_id,
+                }
+            ]
+        )
+
+
 def handle_trap_prevent_destruction(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
@@ -805,6 +911,8 @@ KEYWORD_HANDLERS: Dict[str, KeywordHandler] = {
     "SPELL_CLEANSE_MONSTER": handle_spell_cleanse_monster,
     # Reactive / traps
     "SPELL_COUNTER_SPELL": handle_spell_counter_spell,
+    "TRAP_COUNTER_SPELL": handle_spell_counter_spell,  # Alias for trap counter spells
+    "TRAP_NEGATE_ATTACK": handle_trap_negate_attack,
     "TRAP_REFLECT_DAMAGE": handle_trap_reflect_damage,
     "TRAP_APPLY_STATUS": handle_trap_apply_status,
     "TRAP_PREVENT_DESTRUCTION": handle_trap_prevent_destruction,
