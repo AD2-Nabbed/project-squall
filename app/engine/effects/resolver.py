@@ -326,6 +326,23 @@ def _apply_status_to_monster(
         statuses = [{"code": s, "duration_type": "PERMANENT"} for s in statuses]
         card["statuses"] = statuses
     
+    # Check if monster has STATUS_IMMUNE (prevents all status application)
+    has_status_immune = any(s.get("code") == "STATUS_IMMUNE" for s in statuses)
+    if has_status_immune and status_code != "STATUS_IMMUNE":
+        # Monster is immune to statuses (except STATUS_IMMUNE itself can be applied)
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_STATUS_BLOCKED",
+                    "reason": "STATUS_IMMUNE",
+                    "player_index": player_index,
+                    "zone_index": zone_index,
+                    "card_instance_id": card.get("instance_id"),
+                    "blocked_status": status_code,
+                }
+            ]
+        )
+    
     status_entry = {
         "code": status_code,
         "duration_type": duration_type,
@@ -484,6 +501,131 @@ def handle_spell_draw_cards(
     )
 
 
+def _find_lowest_hp_monster(game_state: Dict[str, Any], player_index: int) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Return (zone_index, card) of the lowest-HP monster for the given player, or None."""
+    players = game_state.get("players", {})
+    p_state = players.get(str(player_index))
+    if not p_state:
+        return None
+    monster_zones = p_state.get("monster_zones") or []
+    lowest = None
+    for idx, card in enumerate(monster_zones):
+        if card is None:
+            continue
+        hp = card.get("hp", 0)
+        if lowest is None or hp < lowest[1].get("hp", 0):
+            lowest = (idx, card)
+    return lowest
+
+
+def handle_hero_active_soul_rend(ctx: EffectContext, params: Dict[str, Any]) -> EffectResult:
+    """
+    Hero active: Soul Rend
+    - Cost: charge_cost (default 3) from hero_charges
+    - Destroy one face-up enemy monster (target must be face-up if target_face_up=True)
+    - If destroyed monster hp_before > threshold (default 200), buff lowest-HP ally monster +hp_buff (default 100 HP)
+    """
+    source_card = ctx.source_card
+    charge_cost = int(params.get("charge_cost", 3))
+    hp_threshold = int(params.get("if_target_hp_gt", 200))
+    buff_amount = int(params.get("buff_lowest_ally_hp_increase", 100))
+    require_face_up = bool(params.get("target_face_up", True))
+
+    # Charges live on the hero card
+    current_charges = int(source_card.get("hero_charges", 0) or 0)
+    if current_charges < charge_cost:
+        return EffectResult(
+            cancelled=True,
+            log_events=[
+                {
+                    "type": "EFFECT_HERO_NOT_ENOUGH_CHARGES",
+                    "needed": charge_cost,
+                    "current": current_charges,
+                }
+            ],
+        )
+
+    # Target monster
+    ref = _get_monster_ref_from_targets(ctx)
+    if not ref:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "MONSTER_NOT_FOUND",
+                    "card_code": source_card.get("card_code"),
+                }
+            ]
+        )
+
+    target_player_index, target_zone_index, target_card = ref
+
+    if require_face_up and target_card.get("face_down", False):
+        return EffectResult(
+            cancelled=True,
+            log_events=[
+                {
+                    "type": "EFFECT_INVALID_TARGET",
+                    "reason": "TARGET_MUST_BE_FACE_UP",
+                    "card_code": source_card.get("card_code"),
+                    "card_instance_id": target_card.get("instance_id"),
+                }
+            ],
+        )
+
+    hp_before = target_card.get("hp", 0)
+
+    # Spend charges
+    source_card["hero_charges"] = current_charges - charge_cost
+
+    # Destroy target
+    target_card["hp"] = 0
+    destroyed = [(target_player_index, target_zone_index)]
+
+    log_events = [
+        {
+            "type": "EFFECT_HERO_SPEND_CHARGE",
+            "spent": charge_cost,
+            "remaining": source_card.get("hero_charges", 0),
+        },
+        {
+            "type": "EFFECT_DESTROY_MONSTER",
+            "player_index": target_player_index,
+            "zone_index": target_zone_index,
+            "card_instance_id": target_card.get("instance_id"),
+            "hp_before": hp_before,
+            "reason": "SOUL_REND",
+        },
+    ]
+
+    # Conditional buff to lowest-HP ally
+    if hp_before > hp_threshold and buff_amount > 0:
+        lowest = _find_lowest_hp_monster(ctx.game_state, ctx.source_player)
+        if lowest:
+            ally_zone_idx, ally_card = lowest
+            before_hp = ally_card.get("hp", 0)
+            before_max_hp = ally_card.get("max_hp") or before_hp
+            ally_card["hp"] = before_hp + buff_amount
+            ally_card["max_hp"] = before_max_hp + buff_amount
+            log_events.append(
+                {
+                    "type": "EFFECT_BUFF_MONSTER",
+                    "player_index": ctx.source_player,
+                    "zone_index": ally_zone_idx,
+                    "hp_before": before_hp,
+                    "hp_after": ally_card["hp"],
+                    "max_hp_before": before_max_hp,
+                    "max_hp_after": ally_card["max_hp"],
+                    "card_instance_id": ally_card.get("instance_id"),
+                    "reason": "SOUL_REND_BUFF",
+                }
+            )
+
+    return EffectResult(
+        log_events=log_events,
+        destroyed_monsters=destroyed,
+    )
+
 def handle_spell_buff_monster(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
@@ -590,6 +732,158 @@ def handle_spell_buff_monster(
     return result
 
 
+def handle_spell_haste(
+    ctx: EffectContext, params: Dict[str, Any]
+) -> EffectResult:
+    """
+    Grants haste to a monster, allowing it to attack immediately.
+    Can be used to:
+    - Allow a newly summoned monster to attack this turn
+    - Allow a monster that just attacked to attack again
+    """
+    ref = _get_monster_ref_from_targets(ctx)
+    if not ref:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "MONSTER_NOT_FOUND",
+                    "card_code": ctx.source_card.get("card_code"),
+                }
+            ]
+        )
+    
+    player_index, zone_index, card = ref
+    
+    # Set can_attack to True
+    card["can_attack"] = True
+    
+    return EffectResult(
+        log_events=[
+            {
+                "type": "EFFECT_HASTE",
+                "player_index": player_index,
+                "zone_index": zone_index,
+                "card_instance_id": card.get("instance_id"),
+                "monster_name": card.get("name"),
+            }
+        ]
+    )
+
+
+def handle_hero_active_damage(
+    ctx: EffectContext, params: Dict[str, Any]
+) -> EffectResult:
+    """
+    Hero active ability that deals damage to a target monster.
+    Used for Flamecaller's 100 damage ability.
+    """
+    amount = int(params.get("amount") or params.get("damage", 0))
+    if amount <= 0:
+        return EffectResult()
+    
+    # Target monster if provided; otherwise target player if supplied.
+    ref = _get_monster_ref_from_targets(ctx)
+    if ref:
+        player_index, zone_index, card = ref
+        
+        hp_before = card.get("hp", 0)
+        hp_after = max(0, hp_before - amount)
+        card["hp"] = hp_after
+        
+        overflow = max(0, amount - hp_before) if hp_before > 0 else amount
+        
+        overflow_damage = 0
+        if overflow > 0:
+            p_state = _get_player(ctx.game_state, player_index)
+            player_hp_before = p_state.get("hp", 0)
+            player_hp_after = max(0, player_hp_before - overflow)
+            p_state["hp"] = player_hp_after
+            overflow_damage = player_hp_before - player_hp_after
+        
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_DAMAGE_MONSTER",
+                    "player_index": player_index,
+                    "zone_index": zone_index,
+                    "amount": amount,
+                    "hp_before": hp_before,
+                    "hp_after": hp_after,
+                    "card_instance_id": card.get("instance_id"),
+                    "overflow_to_player": overflow_damage,
+                }
+            ]
+        )
+    
+    # If no monster target, try player target
+    player_target = ctx.targets.get("player")
+    if isinstance(player_target, int):
+        return _apply_damage_to_player(ctx.game_state, player_target, amount)
+    
+    # No valid target
+    return EffectResult(
+        log_events=[
+            {
+                "type": "EFFECT_NO_TARGET",
+                "reason": "NO_MONSTER_OR_PLAYER_TARGET",
+                "card_code": ctx.source_card.get("card_code"),
+            }
+        ]
+    )
+
+
+def handle_hero_active_freeze(
+    ctx: EffectContext, params: Dict[str, Any]
+) -> EffectResult:
+    """
+    Hero active ability that freezes a monster (cannot attack for one round),
+    then grants immunity to statuses for one round to prevent freeze spam.
+    Used for Frost Warden's ability.
+    
+    Rotation:
+    - Freeze applied: Monster frozen for 1 round (2 turns = until end of affected player's next turn)
+    - When freeze expires: Status Immune applied for 1 round (2 turns = until end of affected player's next turn)
+    """
+    ref = _get_monster_ref_from_targets(ctx)
+    if not ref:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "MONSTER_NOT_FOUND",
+                    "card_code": ctx.source_card.get("card_code"),
+                }
+            ]
+        )
+    
+    player_index, zone_index, card = ref
+    
+    # Apply freeze status (1 round = 2 turns = until end of affected player's next turn)
+    statuses = card.get("statuses") or []
+    statuses.append({
+        "code": "FROZEN",
+        "duration_type": "FIXED_TURNS",
+        "duration_value": 2,  # 1 round = 2 turns
+        "on_expire": "STATUS_IMMUNE",  # When freeze expires, apply status immunity
+    })
+    
+    card["statuses"] = statuses
+    card["can_attack"] = False  # Freeze prevents attack
+    
+    return EffectResult(
+        log_events=[
+            {
+                "type": "EFFECT_FREEZE_MONSTER",
+                "player_index": player_index,
+                "zone_index": zone_index,
+                "card_instance_id": card.get("instance_id"),
+                "monster_name": card.get("name"),
+            }
+        ]
+    )
+
+
 def handle_spell_cleanse_monster(
     ctx: EffectContext, params: Dict[str, Any]
 ) -> EffectResult:
@@ -638,10 +932,11 @@ def handle_spell_counter_spell(
          original spell's effects and instead log that it was countered.
       3. If reflect_spell is True (default), the spell should be reflected back to the caster.
     """
-    # Default to reflecting spells unless explicitly disabled
-    reflect_spell = params.get("reflect_spell", True)
-    if "reflect_spell" not in params and "reflect" in params:
-        reflect_spell = params.get("reflect", True)
+    # Default: only counter. Reflect only if explicitly enabled.
+    reflect_spell = params.get("reflect_spell")
+    if reflect_spell is None and "reflect" in params:
+        reflect_spell = params.get("reflect")
+    reflect_spell = bool(reflect_spell)
     
     result = EffectResult(
         cancelled=True,
@@ -790,6 +1085,8 @@ def handle_trap_negate_attack(
     reflect_damage = params.get("reflect_damage", True)
     damage_amount = params.get("damage_amount")
     
+    destroyed: List[Tuple[int, int]] = []
+
     if reflect_damage:
         # Default to dealing attacker's ATK as damage, or use specified amount
         damage_to_deal = int(damage_amount) if damage_amount is not None else int(attacker_atk)
@@ -797,9 +1094,13 @@ def handle_trap_negate_attack(
         hp_before = attacker.get("hp", 0)
         hp_after = max(0, hp_before - damage_to_deal)
         attacker["hp"] = hp_after
+
+        if hp_after <= 0:
+            destroyed.append((attacker_player_index, attacker_zone_index))
         
         return EffectResult(
             cancelled=True,  # Cancel the attack
+            destroyed_monsters=destroyed,
             log_events=[
                 {
                     "type": "EFFECT_NEGATE_ATTACK",
@@ -821,6 +1122,7 @@ def handle_trap_negate_attack(
         # Just negate, no damage
         return EffectResult(
             cancelled=True,
+            destroyed_monsters=destroyed,
             log_events=[
                 {
                     "type": "EFFECT_NEGATE_ATTACK",
@@ -872,14 +1174,12 @@ def handle_trap_prevent_destruction(
     prevent_destruction_hp = int(params.get("prevent_destruction_hp", 1))
     
     hp_before = card.get("hp", 0)
-    hp_after = max(prevent_destruction_hp, hp_before)  # Don't reduce HP, only prevent destruction
-    
-    # Only set HP if monster would be destroyed (HP <= 0)
+    # If the monster would be destroyed (hp_before <= 0), set to prevent_destruction_hp.
+    # If it's already above 0, leave it (trap triggers after combat when it hit 0).
     if hp_before <= 0:
         card["hp"] = prevent_destruction_hp
         hp_after = prevent_destruction_hp
     else:
-        # Monster wasn't destroyed, no change needed
         hp_after = hp_before
     
     return EffectResult(
@@ -907,8 +1207,14 @@ KEYWORD_HANDLERS: Dict[str, KeywordHandler] = {
     "SPELL_HEAL_PLAYER": handle_spell_heal_player,
     "SPELL_APPLY_STATUS": handle_spell_apply_status,
     "SPELL_DRAW_CARDS": handle_spell_draw_cards,
+    "SPELL_DRAW": handle_spell_draw_cards,  # Alias
     "SPELL_BUFF_MONSTER": handle_spell_buff_monster,
     "SPELL_CLEANSE_MONSTER": handle_spell_cleanse_monster,
+    "SPELL_HASTE": handle_spell_haste,
+    # Hero abilities
+    "HERO_ACTIVE_DAMAGE": handle_hero_active_damage,
+    "HERO_ACTIVE_FREEZE": handle_hero_active_freeze,
+    "HERO_ACTIVE_SOUL_REND": handle_hero_active_soul_rend,
     # Reactive / traps
     "SPELL_COUNTER_SPELL": handle_spell_counter_spell,
     "TRAP_COUNTER_SPELL": handle_spell_counter_spell,  # Alias for trap counter spells

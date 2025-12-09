@@ -275,8 +275,9 @@ async function triggerTrap(activate) {
             updateGameBoard();
             
             // If trap cancelled the action, we're done
+            // If attack was completed by trap (prevent-destruction), we're done
             // Otherwise, continue with pending action if it exists
-            if (!response.cancelled_action && wasPendingTrap.pending_action) {
+            if (!response.cancelled_action && !response.attack_completed && wasPendingTrap.pending_action) {
                 const pending = wasPendingTrap.pending_action;
                 // Re-send the original action with correct structure
                 const actionPayload = {
@@ -817,9 +818,13 @@ function formatLogEntry(entry) {
                 } else if (eff.type === 'EFFECT_HEAL_PLAYER') {
                     effectMsgs.push(`Healed Player ${eff.player_index} for ${eff.amount} HP`);
                 } else if (eff.type === 'EFFECT_DRAW_CARDS') {
-                    effectMsgs.push(`Drew ${eff.count} cards`);
+                    effectMsgs.push(`Drew ${eff.amount || eff.count || 0} cards`);
                 } else if (eff.type === 'EFFECT_PREVENT_DESTRUCTION') {
                     effectMsgs.push(`Prevented destruction (HP: ${eff.hp_before} → ${eff.hp_after})`);
+                } else if (eff.type === 'EFFECT_HASTE') {
+                    effectMsgs.push(`Granted haste to ${eff.monster_name || 'monster'}`);
+                } else if (eff.type === 'EFFECT_FREEZE_MONSTER') {
+                    effectMsgs.push(`Froze ${eff.monster_name || 'monster'}`);
                 }
             });
             if (effectMsgs.length > 0) {
@@ -902,9 +907,13 @@ function formatLogEntry(entry) {
                 } else if (eff.type === 'EFFECT_HEAL_PLAYER') {
                     effectMsgs.push(`Healed Player ${eff.player_index} for ${eff.amount} HP`);
                 } else if (eff.type === 'EFFECT_DRAW_CARDS') {
-                    effectMsgs.push(`Drew ${eff.count} cards`);
+                    effectMsgs.push(`Drew ${eff.amount || eff.count || 0} cards`);
                 } else if (eff.type === 'EFFECT_PREVENT_DESTRUCTION') {
                     effectMsgs.push(`Prevented destruction (HP: ${eff.hp_before} → ${eff.hp_after})`);
+                } else if (eff.type === 'EFFECT_HASTE') {
+                    effectMsgs.push(`Granted haste to ${eff.monster_name || 'monster'}`);
+                } else if (eff.type === 'EFFECT_FREEZE_MONSTER') {
+                    effectMsgs.push(`Froze ${eff.monster_name || 'monster'}`);
                 }
             });
             if (effectMsgs.length > 0) {

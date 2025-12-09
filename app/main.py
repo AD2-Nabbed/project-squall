@@ -306,6 +306,39 @@ def _handle_destroyed_monsters(
             destroyed_state["monster_zones"] = monster_zones
             players[pkey_destroyed] = destroyed_state
 
+    # Passive: Gain hero charges when any monster dies
+    for pkey, p_state in players.items():
+        hero = p_state.get("hero")
+        if not hero:
+            continue
+        effect_params = hero.get("effect_params") or {}
+        if isinstance(effect_params, str):
+            try:
+                import json
+                effect_params = json.loads(effect_params)
+            except Exception:
+                effect_params = {}
+        passive_charge = effect_params.get("passive_on_monster_death")
+        if passive_charge and passive_charge.get("keyword") == "HERO_PASSIVE_GAIN_CHARGE_ON_DEATH":
+            amount = int(passive_charge.get("amount", 0))
+            if amount > 0 and destroyed_monsters:
+                gained = amount * len(destroyed_monsters)
+                hero["hero_charges"] = int(hero.get("hero_charges", 0) or 0) + gained
+                # Add log entry
+                log = game_state.get("log") or []
+                log.append(
+                    {
+                        "type": "HERO_CHARGE_GAINED",
+                        "player": int(pkey),
+                        "hero_instance_id": hero.get("instance_id"),
+                        "amount": gained,
+                        "reason": "MONSTER_DEATH",
+                    }
+                )
+                game_state["log"] = log
+                p_state["hero"] = hero
+                players[pkey] = p_state
+
 
 def _fetch_card_variant(card_code: str, element_id: Optional[int]) -> Optional[Dict[str, Any]]:
     """
@@ -701,6 +734,9 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
     if payload.action == "END_TURN":
         next_player = 2 if current_player == 1 else 1
 
+        # Apply end-of-turn hero passives for the player ending their turn
+        _apply_end_turn_passives(game_state, current_player, log)
+
         # Bump turn counter
         game_state["turn"] = int(game_state.get("turn", 1)) + 1
         game_state["current_player"] = next_player
@@ -814,11 +850,11 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
             tribute_ids = pm.tribute_instance_ids or []
             if len(tribute_ids) != 2:
                 raise HTTPException(status_code=400, detail="Hero requires exactly 2 tributes")
-            
+
             # Check hero zone is empty
             if p_state.get("hero") is not None:
                 raise HTTPException(status_code=400, detail="Hero zone already occupied")
-            
+
             # Remove tributes from monster_zones
             monster_zones = p_state.get("monster_zones") or []
             graveyard = p_state.get("graveyard") or []
@@ -831,13 +867,13 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                         found = True
                         break
                 if not found:
-                    raise HTTPException(status_code=400, detail=f"Tribute monster {tid} not found")
-            
+                    raise HTTPException(status_code=409, detail="Selected tribute is no longer on the board. Please reselect tributes.")
+
             # Place hero in hero zone
             card["face_down"] = False
             card["can_attack"] = False  # Rule 2: Heroes cannot attack
             card["summoned_turn"] = game_state["turn"]
-            
+
             p_state["hero"] = card
             p_state["monster_zones"] = monster_zones
             p_state["graveyard"] = graveyard
@@ -847,14 +883,14 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
             _retarget_player_cards_to_element(p_state, p_state["active_element"])
             players[pkey] = p_state
             game_state["players"] = players
-            
+
             # Apply hero passive aura effects (e.g., +ATK/+HP to all monsters)
             # Pass None for target_monster_zone_index to apply to all existing monsters
             _apply_hero_passive_aura(game_state, payload.player_index, card, log, target_monster_zone_index=None)
-            
+
             p_turn["summons"] = 1
             turn_state[pkey] = p_turn
-            
+
             log.append(
                 {
                     "type": "PLAY_HERO",
@@ -1262,7 +1298,7 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     target_monster_info["hp_before"] = eff.get("hp_before")
                     break
             spell_log_entry["target_monster"] = target_monster_info
-        
+
         log.append(spell_log_entry)
 
         # Increment spell/trap counter
@@ -1448,27 +1484,94 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
 
         # Build targets for hero ability
         targets: Dict[str, Any] = {}
-        if aha.target_player_index is not None:
-            targets["player"] = aha.target_player_index
-        if aha.target_monster_instance_id:
-            found = find_monster_by_instance_id(game_state, aha.target_monster_instance_id)
-            if found:
-                targets["monster"] = {
-                    "player_index": found["player_index"],
-                    "zone_index": found["zone_index"],
-                }
+        # Auto-targeting: if no target provided, try to select one.
+        target_monster_id = aha.target_monster_instance_id
+        target_player_idx = aha.target_player_index
+        opponent_idx = 2 if payload.player_index == 1 else 1
 
+        if target_monster_id:
+            found = find_monster_by_instance_id(game_state, target_monster_id)
+            if not found:
+                raise HTTPException(status_code=400, detail="Target monster not found")
+            targets["monster"] = {
+                "player_index": found["player_index"],
+                "zone_index": found["zone_index"],
+            }
+        else:
+            # No target provided: auto-pick enemy monster if exactly one; if none, target enemy player.
+            opp_state = players.get(str(opponent_idx)) or {}
+            opp_mz = opp_state.get("monster_zones") or []
+            alive = [
+                (idx, m) for idx, m in enumerate(opp_mz)
+                if m is not None and m.get("hp", 0) > 0
+            ]
+            if len(alive) == 1:
+                idx, _ = alive[0]
+                targets["monster"] = {"player_index": opponent_idx, "zone_index": idx}
+            elif len(alive) == 0:
+                # No monsters: allow targeting opposing player
+                targets["player"] = opponent_idx
+            else:
+                raise HTTPException(status_code=400, detail="Hero ability requires selecting a target monster")
+
+        if target_player_idx is not None:
+            targets["player"] = target_player_idx
+        
+        # Get effect_params
+        effect_params = hero.get("effect_params") or {}
+        if isinstance(effect_params, str):
+            try:
+                import json
+                effect_params = json.loads(effect_params)
+            except:
+                effect_params = {}
+        
+        # Check for active_ability in effect_params, or use existing effects array
+        active_ability = effect_params.get("active_ability")
+        if active_ability:
+            # New structure: active_ability object
+            ability_keyword = active_ability.get("keyword")
+            if not ability_keyword:
+                # Fallback: check effect_tags
+                effect_tags = hero.get("effect_tags") or []
+                for tag in effect_tags:
+                    if tag.startswith("HERO_ACTIVE_"):
+                        ability_keyword = tag
+                        break
+            
+            if not ability_keyword:
+                raise HTTPException(status_code=400, detail="Hero active ability keyword not found")
+            
+            # Create a temporary card dict with the active ability for the resolver
+            hero_ability_card = hero.copy()
+            hero_ability_card["effect_params"] = {
+                "effects": [{
+                    "keyword": ability_keyword,
+                    **{k: v for k, v in active_ability.items() if k != "keyword"}  # Merge params except keyword
+                }]
+            }
+        else:
+            # Fallback: use existing effects array (for backwards compatibility)
+            hero_ability_card = hero
+        
+        # Create effect context and resolve using the existing resolver
         ctx = EffectContext(
             game_state=game_state,
             source_player=payload.player_index,
-            source_card=hero,
+            source_card=hero_ability_card,
             targets=targets,
             trigger="HERO_ACTIVE",
             trigger_event={"type": "HERO_ACTIVE"},
         )
-
+        
         effect_result = resolve_card_effects(ctx)
         _handle_destroyed_monsters(game_state, effect_result.destroyed_monsters)
+        
+        # Ensure monster zones are updated after ability effects
+        monster_zones = p_state.get("monster_zones") or []
+        p_state["monster_zones"] = monster_zones
+        players[pkey] = p_state
+        game_state["players"] = players
 
         log.append(
             {
@@ -1574,6 +1677,9 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     },
                 )
                 
+                # Handle destroyed by trap
+                _handle_destroyed_monsters(game_state, trap_effect_result.destroyed_monsters)
+
                 # Add trap trigger log
                 log.append({
                     "type": "TRAP_TRIGGERED",
@@ -1753,6 +1859,7 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                         defender_hp_after = defender_found["card"].get("hp", 0)
                 else:
                     # Player trap - return for player decision
+                    # After trap resolves, attack will continue normally
                     return {
                         "match_id": payload.match_id,
                         "game_state": game_state,
@@ -1772,6 +1879,15 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                             "monster_instance_id": am.defender_instance_id,
                             "player_index": def_player_idx,
                             "zone_index": defender_zone_index,
+                            "attacker_instance_id": am.attacker_instance_id,
+                            "attacker_atk": atk_value,
+                            "defender_atk": def_value,
+                            "attacker_hp_before": attacker_hp_before,
+                            "defender_hp_before": defender_hp_before,
+                            "attacker_hp_after": attacker_hp_after,
+                            "defender_hp_after": defender_hp_after,
+                            "attacking_player": atk_player_idx,
+                            "defending_player": def_player_idx,
                         },
                     }
         
@@ -1851,15 +1967,33 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                         },
                     }
 
-        # Move dead defender to graveyard
+        # Move dead defender to graveyard (only if still dead after trap)
         if defender_died:
-            def_graveyard.append(defender)
-            def_mz[defender_zone_index] = None
+            # Re-check HP in case trap prevented destruction
+            defender_found = find_monster_by_instance_id(game_state, am.defender_instance_id)
+            if defender_found and defender_found["card"].get("hp", 0) > 0:
+                # Trap saved it - don't move to graveyard
+                defender_died = False
+                def_mz[defender_zone_index] = defender_found["card"]
+            else:
+                # Still dead - move to graveyard
+                def_graveyard.append(defender)
+                def_mz[defender_zone_index] = None
 
         # Move dead attacker to graveyard or mark that it used its attack
         if attacker_died:
-            atk_graveyard.append(attacker)
-            atk_mz[attacker_zone_index] = None
+            # Re-check HP in case trap prevented destruction
+            attacker_found = find_monster_by_instance_id(game_state, am.attacker_instance_id)
+            if attacker_found and attacker_found["card"].get("hp", 0) > 0:
+                # Trap saved it - don't move to graveyard
+                attacker_died = False
+                attacker = attacker_found["card"]
+                attacker["can_attack"] = False
+                atk_mz[attacker_zone_index] = attacker
+            else:
+                # Still dead - move to graveyard
+                atk_graveyard.append(attacker)
+                atk_mz[attacker_zone_index] = None
         else:
             attacker["can_attack"] = False
             atk_mz[attacker_zone_index] = attacker
@@ -2180,12 +2314,27 @@ def _tick_statuses_on_board(p_state: Dict[str, Any]) -> None:
                     new_s["duration_value"] = val - 1
                     if new_s["duration_value"] > 0:
                         new_statuses.append(new_s)
-                    # If duration reaches 0, status expires (don't add it)
+                    else:
+                        # Duration reached 0 - status expires
+                        # Check if there's an on_expire effect (e.g., FROZEN -> STATUS_IMMUNE)
+                        on_expire = s.get("on_expire")
+                        if on_expire:
+                            # Apply the on_expire status
+                            new_statuses.append({
+                                "code": on_expire,
+                                "duration_type": "FIXED_TURNS",
+                                "duration_value": 2,  # 1 round = 2 turns
+                            })
+                    # If duration reaches 0 and no on_expire, status expires (don't add it)
             else:
                 # PERMANENT or other - keep as-is
                 new_statuses.append(s)
         
         card["statuses"] = new_statuses
+        
+        # Apply status effects (e.g., FROZEN prevents attack)
+        if any(s.get("code") == "FROZEN" for s in new_statuses):
+            card["can_attack"] = False
     
     # Also tick hero statuses if hero exists
     hero = p_state.get("hero")
@@ -2303,6 +2452,61 @@ def _get_available_trap_triggers(
     return available
 
 
+def _apply_end_turn_passives(
+    game_state: Dict[str, Any],
+    player_index: int,
+    log: List[Dict[str, Any]],
+) -> None:
+    """
+    Apply hero passive effects that occur at end of controller's turn.
+    Currently supports:
+    - HERO_PASSIVE_END_TURN_HEAL_FULL: Heal all your monsters to full HP.
+    """
+    players = game_state.get("players", {})
+    p_state = players.get(str(player_index))
+    if not p_state:
+        return
+    hero = p_state.get("hero")
+    if not hero:
+        return
+
+    effect_params = hero.get("effect_params") or {}
+    if isinstance(effect_params, str):
+        try:
+            import json
+            effect_params = json.loads(effect_params)
+        except Exception:
+            effect_params = {}
+
+    passive_end_turn = effect_params.get("passive_end_turn")
+    if not passive_end_turn:
+        return
+
+    if passive_end_turn.get("keyword") == "HERO_PASSIVE_END_TURN_HEAL_FULL":
+        monster_zones = p_state.get("monster_zones") or []
+        for idx, card in enumerate(monster_zones):
+            if card is None:
+                continue
+            before_hp = card.get("hp", 0)
+            max_hp = card.get("max_hp", before_hp)
+            card["hp"] = max_hp
+            monster_zones[idx] = card
+            log.append(
+                {
+                    "type": "HERO_PASSIVE_HEAL_FULL",
+                    "player": player_index,
+                    "hero_instance_id": hero.get("instance_id"),
+                    "zone_index": idx,
+                    "card_instance_id": card.get("instance_id"),
+                    "hp_before": before_hp,
+                    "hp_after": max_hp,
+                }
+            )
+        p_state["monster_zones"] = monster_zones
+        players[str(player_index)] = p_state
+        game_state["players"] = players
+
+
 def _apply_hero_passive_aura(
     game_state: Dict[str, Any],
     player_index: int,
@@ -2314,8 +2518,22 @@ def _apply_hero_passive_aura(
     Apply hero passive aura effects to monsters on the board.
     If target_monster_zone_index is provided, only apply to that monster (for newly summoned monsters).
     Otherwise, apply to all monsters on the board.
-    Looks for HERO_PASSIVE_BUFF_MONSTERS or similar keywords in hero's effect_params.
+    
+    Reads from hero's effect_params.passive_aura:
+    {
+      "passive_aura": {
+        "atk_increase": 100,
+        "hp_increase": 100
+      }
+    }
     """
+    players = game_state.get("players", {})
+    pkey = str(player_index)
+    p_state = players.get(pkey)
+    if not p_state:
+        return
+    
+    # Get passive aura from effect_params
     effect_params = hero.get("effect_params") or {}
     if isinstance(effect_params, str):
         try:
@@ -2324,88 +2542,79 @@ def _apply_hero_passive_aura(
         except:
             effect_params = {}
     
-    effects = effect_params.get("effects") or []
-    players = game_state.get("players", {})
-    pkey = str(player_index)
-    p_state = players.get(pkey)
-    if not p_state:
+    passive_aura = effect_params.get("passive_aura")
+    if not passive_aura:
+        # No passive aura defined
         return
     
-    # Look for passive aura effects (e.g., HERO_PASSIVE_BUFF_MONSTERS or SPELL_BUFF_MONSTER with target_all)
-    for eff in effects:
-        keyword = eff.get("keyword", "")
-        
-        # Check for hero passive buff keyword or spell buff with target_all
-        if keyword == "HERO_PASSIVE_BUFF_MONSTERS" or (keyword == "SPELL_BUFF_MONSTER" and eff.get("target") == "SELF_MONSTERS"):
-            atk_inc = int(eff.get("atk_increase") or eff.get("amount_atk") or eff.get("atk_delta", 0))
-            hp_inc = int(eff.get("hp_increase") or eff.get("amount_hp") or eff.get("hp_delta", 0))
+    atk_inc = int(passive_aura.get("atk_increase", 0))
+    hp_inc = int(passive_aura.get("hp_increase", 0))
+    
+    if atk_inc == 0 and hp_inc == 0:
+        return
+    
+    # Apply to monsters on the board
+    monster_zones = p_state.get("monster_zones") or []
+    if target_monster_zone_index is not None:
+        # Only apply to the newly summoned monster
+        if target_monster_zone_index < len(monster_zones) and monster_zones[target_monster_zone_index] is not None:
+            card = monster_zones[target_monster_zone_index]
+            before_atk = card.get("atk", 0)
+            before_hp = card.get("hp", 0)
+            before_max_hp = card.get("max_hp") or before_hp
             
-            if atk_inc == 0 and hp_inc == 0:
+            card["atk"] = before_atk + atk_inc
+            new_hp = before_hp + hp_inc
+            new_max_hp = before_max_hp + hp_inc
+            card["hp"] = max(0, min(new_hp, new_max_hp))
+            card["max_hp"] = new_max_hp
+            
+            log.append({
+                "type": "HERO_PASSIVE_AURA",
+                "player": player_index,
+                "hero_name": hero.get("name"),
+                "zone_index": target_monster_zone_index,
+                "monster_name": card.get("name"),
+                "atk_before": before_atk,
+                "atk_after": card["atk"],
+                "hp_before": before_hp,
+                "hp_after": card["hp"],
+                "max_hp_before": before_max_hp,
+                "max_hp_after": new_max_hp,
+            })
+    else:
+        # Apply to all monsters on the board
+        for zone_idx, card in enumerate(monster_zones):
+            if card is None:
                 continue
             
-            # Apply to monsters on the board
-            monster_zones = p_state.get("monster_zones") or []
-            if target_monster_zone_index is not None:
-                # Only apply to the newly summoned monster
-                if target_monster_zone_index < len(monster_zones) and monster_zones[target_monster_zone_index] is not None:
-                    card = monster_zones[target_monster_zone_index]
-                    before_atk = card.get("atk", 0)
-                    before_hp = card.get("hp", 0)
-                    before_max_hp = card.get("max_hp") or before_hp
-                    
-                    card["atk"] = before_atk + atk_inc
-                    new_hp = before_hp + hp_inc
-                    new_max_hp = before_max_hp + hp_inc
-                    card["hp"] = max(0, min(new_hp, new_max_hp))
-                    card["max_hp"] = new_max_hp
-                    
-                    log.append({
-                        "type": "HERO_PASSIVE_AURA",
-                        "player": player_index,
-                        "hero_name": hero.get("name"),
-                        "zone_index": target_monster_zone_index,
-                        "monster_name": card.get("name"),
-                        "atk_before": before_atk,
-                        "atk_after": card["atk"],
-                        "hp_before": before_hp,
-                        "hp_after": card["hp"],
-                        "max_hp_before": before_max_hp,
-                        "max_hp_after": new_max_hp,
-                    })
-            else:
-                # Apply to all monsters on the board
-                for zone_idx, card in enumerate(monster_zones):
-                    if card is None:
-                        continue
-                    
-                    before_atk = card.get("atk", 0)
-                    before_hp = card.get("hp", 0)
-                    before_max_hp = card.get("max_hp") or before_hp
-                    
-                    card["atk"] = before_atk + atk_inc
-                    new_hp = before_hp + hp_inc
-                    new_max_hp = before_max_hp + hp_inc
-                    card["hp"] = max(0, min(new_hp, new_max_hp))
-                    card["max_hp"] = new_max_hp
-                    
-                    log.append({
-                        "type": "HERO_PASSIVE_AURA",
-                        "player": player_index,
-                        "hero_name": hero.get("name"),
-                        "zone_index": zone_idx,
-                        "monster_name": card.get("name"),
-                        "atk_before": before_atk,
-                        "atk_after": card["atk"],
-                        "hp_before": before_hp,
-                        "hp_after": card["hp"],
-                        "max_hp_before": before_max_hp,
-                        "max_hp_after": new_max_hp,
-                    })
+            before_atk = card.get("atk", 0)
+            before_hp = card.get("hp", 0)
+            before_max_hp = card.get("max_hp") or before_hp
             
-            p_state["monster_zones"] = monster_zones
-            players[pkey] = p_state
-            game_state["players"] = players
-            break  # Only apply first matching passive effect
+            card["atk"] = before_atk + atk_inc
+            new_hp = before_hp + hp_inc
+            new_max_hp = before_max_hp + hp_inc
+            card["hp"] = max(0, min(new_hp, new_max_hp))
+            card["max_hp"] = new_max_hp
+            
+            log.append({
+                "type": "HERO_PASSIVE_AURA",
+                "player": player_index,
+                "hero_name": hero.get("name"),
+                "zone_index": zone_idx,
+                "monster_name": card.get("name"),
+                "atk_before": before_atk,
+                "atk_after": card["atk"],
+                "hp_before": before_hp,
+                "hp_after": card["hp"],
+                "max_hp_before": before_max_hp,
+                "max_hp_after": new_max_hp,
+            })
+    
+    p_state["monster_zones"] = monster_zones
+    players[pkey] = p_state
+    game_state["players"] = players
 
 
 class TriggerTrapRequest(BaseModel):
@@ -2467,10 +2676,20 @@ def trigger_trap(payload: TriggerTrapRequest) -> Dict[str, Any]:
     targets: Dict[str, Any] = {}
     
     # Extract target from trigger_event if available
-    trigger_event = payload.trigger_event or payload.pending_action or {}
+    trigger_event = payload.trigger_event or {}
     if isinstance(trigger_event, dict):
+        # For prevent-destruction traps, extract monster_instance_id from trigger_event
+        if trigger_event.get("type") == "MONSTER_WOULD_BE_DESTROYED":
+            monster_instance_id = trigger_event.get("monster_instance_id")
+            if monster_instance_id:
+                found = find_monster_by_instance_id(game_state, monster_instance_id)
+                if found:
+                    targets["monster"] = {
+                        "player_index": found["player_index"],
+                        "zone_index": found["zone_index"],
+                    }
         # For attack triggers, extract attacker_instance_id
-        if trigger_event.get("type") in ("ATTACK_MONSTER", "ATTACK_PLAYER"):
+        elif trigger_event.get("type") in ("ATTACK_MONSTER", "ATTACK_PLAYER"):
             attacker_instance_id = trigger_event.get("attacker_instance_id")
             if attacker_instance_id:
                 found = find_monster_by_instance_id(game_state, attacker_instance_id)
@@ -2520,6 +2739,9 @@ def trigger_trap(payload: TriggerTrapRequest) -> Dict[str, Any]:
         "effects": effect_result.log_events,
         "cancelled_action": effect_result.cancelled,
     })
+    
+    # Initialize attack_completed flag
+    attack_completed = False
     
     # If trap cancelled the action, don't process pending_action
     if effect_result.cancelled and payload.pending_action:
@@ -2605,6 +2827,18 @@ def trigger_trap(payload: TriggerTrapRequest) -> Dict[str, Any]:
                                 reason="reflected_spell_effects",
                             )
     
+    # Last Stand Ward: Just set HP to 1, let attack continue normally
+    # If this was a prevent-destruction trap, the attack was already resolved; don't re-run it.
+    attack_completed = False
+    if (
+        not effect_result.cancelled
+        and payload.pending_action
+        and payload.pending_action.get("action") == "ATTACK_MONSTER"
+        and payload.trigger_type == "ON_ALLY_MONSTER_WOULD_BE_DESTROYED"
+    ):
+        # Mark attack as completed so frontend does NOT resend the attack.
+        attack_completed = True
+    
     # Save state
     supabase.table("matches").update({
         "serialized_game_state": game_state,
@@ -2615,6 +2849,7 @@ def trigger_trap(payload: TriggerTrapRequest) -> Dict[str, Any]:
         "game_state": game_state,
         "trap_activated": True,
         "cancelled_action": effect_result.cancelled,
+        "attack_completed": attack_completed,
     }
 
 
