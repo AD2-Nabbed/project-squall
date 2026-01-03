@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Project Squall - Deck Manager</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Navigation -->
+        <nav class="navbar" id="navbar" style="display: none;">
+            <div class="nav-brand">Project Squall</div>
+            <div class="nav-links">
+                <a href="#" onclick="showDashboard()">Dashboard</a>
+                <a href="#" onclick="showCardCatalog()">Card Catalog</a>
+                <a href="#" onclick="showMyDecks()">My Decks</a>
+                <a href="#" onclick="showGame()">Play Match</a>
+                <a href="#" onclick="logout()">Logout</a>
+            </div>
+        </nav>
+
+        <!-- Login/Register Page -->
+        <div class="page" id="loginPage">
+            <div class="auth-container">
+                <h1>Project Squall</h1>
+                <div class="auth-tabs">
+                    <button class="tab-btn active" onclick="switchTab('login')">Login</button>
+                    <button class="tab-btn" onclick="switchTab('register')">Register</button>
+                </div>
+
+                <!-- Login Form -->
+                <div class="auth-form" id="loginForm">
+                    <input type="text" id="loginUsername" placeholder="Username" required>
+                    <input type="password" id="loginPassword" placeholder="Password" required>
+                    <button class="btn btn-primary" onclick="handleLogin()">Login</button>
+                    <div id="loginError" class="error-message"></div>
+                </div>
+
+                <!-- Register Form -->
+                <div class="auth-form" id="registerForm" style="display: none;">
+                    <input type="text" id="registerUsername" placeholder="Username" required>
+                    <input type="password" id="registerPassword" placeholder="Password" required>
+                    <input type="text" id="registerGamerTag" placeholder="Gamer Tag" required>
+                    <button class="btn btn-primary" onclick="handleRegister()">Register</button>
+                    <div id="registerError" class="error-message"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dashboard -->
+        <div class="page" id="dashboardPage" style="display: none;">
+            <h1>Dashboard</h1>
+            <div class="dashboard-grid">
+                <div class="dashboard-card">
+                    <h2>Player Info</h2>
+                    <div id="playerInfo">
+                        <p><strong>Gamer Tag:</strong> <span id="playerGamerTag">-</span></p>
+                        <p><strong>Player ID:</strong> <span id="playerId">-</span></p>
+                    </div>
+                </div>
+                <div class="dashboard-card">
+                    <h2>Quick Actions</h2>
+                    <button class="btn btn-primary" onclick="showCardCatalog()">Card Catalog</button>
+                    <button class="btn btn-primary" onclick="showMyDecks()">My Decks</button>
+                    <button class="btn btn-primary" onclick="showGame()">Play Match</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Card Catalog -->
+        <div class="page" id="catalogPage" style="display: none;">
+            <h1>Card Catalog</h1>
+            <div class="catalog-controls">
+                <input type="text" id="cardSearch" placeholder="Search cards..." onkeyup="filterCards()">
+                <select id="cardTypeFilter" onchange="filterCards()">
+                    <option value="">All Types</option>
+                    <option value="monster">Monster</option>
+                    <option value="spell">Spell</option>
+                    <option value="trap">Trap</option>
+                    <option value="hero">Hero</option>
+                </select>
+            </div>
+            <div class="catalog-grid" id="catalogGrid"></div>
+        </div>
+
+        <!-- My Decks -->
+        <div class="page" id="decksPage" style="display: none;">
+            <h1>My Decks</h1>
+            <button class="btn btn-primary" onclick="showDeckEditor(null)">Create New Deck</button>
+            <div class="decks-list" id="decksList"></div>
+        </div>
+
+        <!-- Deck Editor -->
+        <div class="page" id="deckEditorPage" style="display: none;">
+            <h1 id="deckEditorTitle">Create Deck</h1>
+            <div class="deck-editor">
+                <div class="deck-info">
+                    <input type="text" id="deckName" placeholder="Deck Name" required>
+                    <label>
+                        <input type="checkbox" id="deckIsPublic"> Public Deck
+                    </label>
+                    <button class="btn btn-primary" onclick="saveDeck()">Save Deck</button>
+                    <button class="btn btn-secondary" onclick="showMyDecks()">Cancel</button>
+                </div>
+                <div id="deckValidation" class="deck-validation"></div>
+                <div class="deck-editor-grid">
+                    <div class="owned-cards-panel">
+                        <div class="panel-header">
+                            <h3>Your Cards</h3>
+                            <select id="deckCardTypeFilter" class="card-filter-dropdown" onchange="filterAndDisplayOwnedCards()">
+                                <option value="">All Cards</option>
+                                <option value="hero">Hero</option>
+                                <option value="monster-4">Monster 4 Star</option>
+                                <option value="monster-3">Monster 3 Star</option>
+                                <option value="monster-2">Monster 2 Star</option>
+                                <option value="monster-1">Monster 1 Star</option>
+                                <option value="spell">Spell</option>
+                                <option value="trap">Trap</option>
+                            </select>
+                        </div>
+                        <div id="ownedCardsList"></div>
+                    </div>
+                    <div class="deck-cards-panel">
+                        <h3>Deck Cards</h3>
+                        <div id="deckCardsList"></div>
+                        <div id="deckStats" class="deck-stats"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Game Page (integrated from existing frontend) -->
+        <div class="page" id="gamePage" style="display: none;">
+            <h1>Play Match</h1>
+            <div class="game-setup">
+                <label>Select Deck:</label>
+                <select id="gameDeckSelect"></select>
+                <button class="btn btn-primary" onclick="startGameFromWeb()">Start Match</button>
+            </div>
+            <div id="gameContainer"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
+

@@ -54,6 +54,7 @@ class CardInstance:
     # Effects from DB
     effect_tags: List[str] = field(default_factory=list)
     effect_params: dict = field(default_factory=dict)
+    hero_data: Optional[dict] = None  # For hero active abilities
     
     # Card description/flavor text
     description: Optional[str] = None
@@ -95,6 +96,7 @@ class CardInstance:
             can_attack=False,
             effect_tags=card_def.get("effect_tags") or [],
             effect_params=card_def.get("effect_params") or {},
+            hero_data=card_def.get("hero_data"),
             description=card_def.get("description") or card_def.get("rules_text") or None,
             art_asset_id=card_def.get("art_asset_id") or None,
             flavor_text=card_def.get("flavor_text") or None,

@@ -20,6 +20,30 @@ const USE_CARD_IMAGES = false; // Set to false to use text-only cards
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     console.log('Game initialized');
+    
+    // Read URL parameters and auto-fill form
+    const urlParams = new URLSearchParams(window.location.search);
+    const deckId = urlParams.get('deck_id');
+    const playerId = urlParams.get('player_id');
+    
+    if (deckId) {
+        const deckInput = document.getElementById('deckId');
+        if (deckInput) {
+            deckInput.value = deckId;
+        }
+    }
+    
+    if (playerId) {
+        const playerInput = document.getElementById('playerId');
+        if (playerInput) {
+            playerInput.value = playerId;
+        }
+    }
+    
+    // If both are provided, auto-start the match (optional - comment out if you want manual start)
+    // if (deckId && playerId) {
+    //     startMatch();
+    // }
 });
 
 // API calls
@@ -406,6 +430,36 @@ function updateZones(prefix, player) {
     const isOpponent = prefix === 'opponent';
     const isMyPlayer = prefix === 'player';
     
+    const renderStatusTags = (monster) => {
+        const rawStatuses = monster.statuses || [];
+        if (!rawStatuses.length) return '';
+
+        const statuses = rawStatuses.map(s => typeof s === 'string' ? { code: s } : s).filter(s => s && s.code);
+        if (!statuses.length) return '';
+
+        const labelMap = {
+            FROZEN: 'Frozen',
+            STATUS_IMMUNE: 'Status Immune',
+            HASTE: 'Haste',
+            BURN: 'Burn',
+        };
+        const classMap = {
+            FROZEN: 'status-frozen',
+            STATUS_IMMUNE: 'status-immune',
+            HASTE: 'status-haste',
+            BURN: 'status-burn',
+        };
+
+        const tags = statuses.map(s => {
+            const code = (s.code || '').toUpperCase();
+            const label = labelMap[code] || code;
+            const cls = classMap[code] || 'status-generic';
+            return `<span class="status-tag ${cls}">${label}</span>`;
+        });
+
+        return `<div class="zone-card-status-tags">${tags.join('')}</div>`;
+    };
+
     // Monster zones
     const monsterContainer = document.getElementById(`${prefix}Monsters`);
     player.monster_zones.forEach((monster, idx) => {
@@ -431,6 +485,7 @@ function updateZones(prefix, player) {
                         <div class="zone-card-stats">⭐${monster.stars} | ${monster.atk}/${monster.hp}</div>
                         <div class="zone-card-status">Face Down</div>
                         <div class="zone-card-status ${attackStatusClass}">${attackStatus}</div>
+                        ${renderStatusTags(monster)}
                     </div>
                 `;
             } else {
@@ -459,6 +514,7 @@ function updateZones(prefix, player) {
                             ${buffDisplay}
                             ${monster.hp < monster.max_hp ? `<div class="zone-card-damage">-${monster.max_hp - monster.hp}</div>` : ''}
                             <div class="zone-card-status ${attackStatusClass}">${attackStatus}</div>
+                            ${renderStatusTags(monster)}
                         </div>
                     `;
                 } else {
@@ -469,6 +525,7 @@ function updateZones(prefix, player) {
                             ${buffDisplay}
                             ${monster.hp < monster.max_hp ? `<div class="zone-card-damage">-${monster.max_hp - monster.hp}</div>` : ''}
                             <div class="zone-card-status ${attackStatusClass}">${attackStatus}</div>
+                            ${renderStatusTags(monster)}
                         </div>
                     `;
                 }
