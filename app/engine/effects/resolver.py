@@ -740,6 +740,7 @@ def handle_spell_haste(
     Can be used to:
     - Allow a newly summoned monster to attack this turn
     - Allow a monster that just attacked to attack again
+    Also flips the monster face-up if it was face-down, since face-down monsters cannot attack.
     """
     ref = _get_monster_ref_from_targets(ctx)
     if not ref:
@@ -754,6 +755,10 @@ def handle_spell_haste(
         )
     
     player_index, zone_index, card = ref
+    
+    # Flip face-up if face-down (face-down monsters cannot attack)
+    if card.get("face_down", False):
+        card["face_down"] = False
     
     # Set can_attack to True
     card["can_attack"] = True
@@ -777,6 +782,7 @@ def handle_hero_active_damage(
     """
     Hero active ability that deals damage to a target monster.
     Used for Flamecaller's 100 damage ability.
+    Always applies overflow damage to the player (like a fireball spell).
     """
     amount = int(params.get("amount") or params.get("damage", 0))
     if amount <= 0:
@@ -785,36 +791,46 @@ def handle_hero_active_damage(
     # Target monster if provided; otherwise target player if supplied.
     ref = _get_monster_ref_from_targets(ctx)
     if ref:
-        player_index, zone_index, card = ref
+        # Use _apply_damage_to_monster to get proper destruction tracking and log events
+        result = _apply_damage_to_monster(ctx, amount)
         
-        hp_before = card.get("hp", 0)
-        hp_after = max(0, hp_before - amount)
-        card["hp"] = hp_after
+        # Always apply overflow damage (hero abilities are like fireballs)
+        # Get the monster's HP before damage from the log event
+        hp_before = None
+        if result.log_events:
+            for event in result.log_events:
+                if event.get("type") == "EFFECT_DAMAGE_MONSTER":
+                    hp_before = event.get("hp_before", 0)
+                    break
         
-        overflow = max(0, amount - hp_before) if hp_before > 0 else amount
+        if hp_before is not None:
+            # Calculate overflow: excess damage beyond what was needed to kill the monster
+            overflow_amount = max(0, amount - hp_before)
+            
+            if overflow_amount > 0:
+                # Get the target player (the controller of the monster that was damaged)
+                target_player_index = ctx.targets.get("player")
+                if not isinstance(target_player_index, int):
+                    # If not specified, get it from the monster that was damaged
+                    if result.log_events:
+                        for event in result.log_events:
+                            if event.get("type") == "EFFECT_DAMAGE_MONSTER":
+                                target_player_index = event.get("player_index")
+                                break
+                
+                if isinstance(target_player_index, int):
+                    overflow_res = _apply_damage_to_player(
+                        ctx.game_state, target_player_index, overflow_amount
+                    )
+                    _merge_effect_results(result, overflow_res)
+                    
+                    # Update the log event to include overflow info
+                    for event in result.log_events:
+                        if event.get("type") == "EFFECT_DAMAGE_MONSTER":
+                            event["overflow_to_player"] = overflow_amount
+                            break
         
-        overflow_damage = 0
-        if overflow > 0:
-            p_state = _get_player(ctx.game_state, player_index)
-            player_hp_before = p_state.get("hp", 0)
-            player_hp_after = max(0, player_hp_before - overflow)
-            p_state["hp"] = player_hp_after
-            overflow_damage = player_hp_before - player_hp_after
-        
-        return EffectResult(
-            log_events=[
-                {
-                    "type": "EFFECT_DAMAGE_MONSTER",
-                    "player_index": player_index,
-                    "zone_index": zone_index,
-                    "amount": amount,
-                    "hp_before": hp_before,
-                    "hp_after": hp_after,
-                    "card_instance_id": card.get("instance_id"),
-                    "overflow_to_player": overflow_damage,
-                }
-            ]
-        )
+        return result
     
     # If no monster target, try player target
     player_target = ctx.targets.get("player")
