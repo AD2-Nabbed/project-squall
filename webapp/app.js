@@ -353,15 +353,6 @@ async function loadDeck(deckId) {
 async function loadOwnedCards() {
     try {
         ownedCards = await apiCall('/api/cards/owned');
-        // Debug: Log the structure of the first card to see what we're getting
-        if (ownedCards.length > 0) {
-            console.log('First owned card structure:', JSON.stringify(ownedCards[0], null, 2));
-            const firstCard = ownedCards[0]?.cards;
-            if (firstCard) {
-                console.log('First card has card_type:', firstCard.card_type);
-                console.log('First card has card_type_id:', firstCard.card_type_id);
-            }
-        }
         displayOwnedCards();
     } catch (error) {
         console.error('Failed to load owned cards:', error);
@@ -389,11 +380,8 @@ function getCardSortKey(card) {
 
 // Filter and sort owned cards
 function filterAndDisplayOwnedCards() {
-    const filterValue = document.getElementById('deckCardTypeFilter')?.value || '';
+    const filterValue = document.getElementById('cardTypeFilter')?.value || '';
     const list = document.getElementById('ownedCardsList');
-    if (!list) {
-        return;
-    }
     list.innerHTML = '';
     
     if (ownedCards.length === 0) {
@@ -406,18 +394,10 @@ function filterAndDisplayOwnedCards() {
     if (filterValue) {
         filteredCards = ownedCards.filter(owned => {
             const card = owned.cards;
-            if (!card) {
-                console.log('Card missing for owned item:', owned);
-                return false;
-            }
+            if (!card) return false;
             
             const cardType = (card.card_type || 'unknown').toLowerCase();
             const stars = card.stars || 0;
-            
-            // Debug: log first few cards to see their structure
-            if (ownedCards.indexOf(owned) < 3) {
-                console.log(`Card: ${card.name}, card_type: ${card.card_type}, card_type_id: ${card.card_type_id}, type (lowercase): ${cardType}`);
-            }
             
             if (filterValue === 'hero') {
                 return cardType === 'hero';
@@ -425,17 +405,12 @@ function filterAndDisplayOwnedCards() {
                 const targetStars = parseInt(filterValue.split('-')[1]);
                 return cardType === 'monster' && stars === targetStars;
             } else if (filterValue === 'spell') {
-                const matches = cardType === 'spell';
-                if (ownedCards.indexOf(owned) < 3) {
-                    console.log(`  Spell filter check: ${card.name} -> ${matches} (cardType: ${cardType})`);
-                }
-                return matches;
+                return cardType === 'spell';
             } else if (filterValue === 'trap') {
                 return cardType === 'trap';
             }
             return true;
         });
-        console.log('Filtered cards count:', filteredCards.length);
     }
     
     // Sort cards by type/stars, then by name
@@ -791,9 +766,8 @@ async function startGameFromWeb() {
         return;
     }
     
-    // Redirect to the frontend game (assumes it's running on port 8081 or same origin)
-    // If frontend is on a different port, update this URL
-    // For now, use absolute URL assuming frontend runs on http://localhost:8081
-    window.location.href = `http://localhost:8081/index.html?deck_id=${deckId}&player_id=${currentUser.player_id}`;
+    // Load the game iframe or redirect
+    // For now, redirect to game with deck pre-selected
+    window.location.href = `../frontend/index.html?deck_id=${deckId}&player_id=${currentUser.player_id}`;
 }
 

@@ -1615,25 +1615,6 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
                     }
                 )
         
-        # Capture target monster info BEFORE ability effect (for logging)
-        target_monster_info = None
-        if targets.get("monster"):
-            monster_target = targets["monster"]
-            target_player_idx = monster_target.get("player_index")
-            target_zone_idx = monster_target.get("zone_index")
-            if target_player_idx is not None and target_zone_idx is not None:
-                target_player_state = players.get(str(target_player_idx)) or {}
-                target_monster_zones = target_player_state.get("monster_zones") or []
-                if target_zone_idx < len(target_monster_zones) and target_monster_zones[target_zone_idx] is not None:
-                    target_card = target_monster_zones[target_zone_idx]
-                    target_monster_info = {
-                        "name": target_card.get("name", "Unknown"),
-                        "atk": target_card.get("atk", 0),
-                        "hp": target_card.get("hp", 0),
-                        "max_hp": target_card.get("max_hp", 0),
-                        "hp_before": target_card.get("hp", 0),
-                    }
-        
         # Create effect context and resolve using the existing resolver
         ctx = EffectContext(
             game_state=game_state,
@@ -1653,25 +1634,15 @@ def battle_action(payload: BattleActionRequest) -> Dict[str, Any]:
         players[pkey] = p_state
         game_state["players"] = players
 
-        # Build hero ability log entry with target info (similar to spells)
-        hero_ability_log_entry: Dict[str, Any] = {
-            "type": "ACTIVATE_HERO_ABILITY",
-            "player": payload.player_index,
-            "hero_instance_id": hero.get("instance_id"),
-            "card_name": hero.get("name"),
-            "effects": effect_result.log_events,
-        }
-        
-        # Add target monster info if available
-        if target_monster_info:
-            # Update hp_before from effect_result if available
-            for eff in effect_result.log_events:
-                if eff.get("type") == "EFFECT_DAMAGE_MONSTER" and eff.get("hp_before") is not None:
-                    target_monster_info["hp_before"] = eff.get("hp_before")
-                    break
-            hero_ability_log_entry["target_monster"] = target_monster_info
-        
-        log.append(hero_ability_log_entry)
+        log.append(
+            {
+                "type": "ACTIVATE_HERO_ABILITY",
+                "player": payload.player_index,
+                "hero_instance_id": hero.get("instance_id"),
+                "card_name": hero.get("name"),
+                "effects": effect_result.log_events,
+            }
+        )
 
         p_turn["hero_ability"] = 1
         turn_state[pkey] = p_turn

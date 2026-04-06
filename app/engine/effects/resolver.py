@@ -740,7 +740,6 @@ def handle_spell_haste(
     Can be used to:
     - Allow a newly summoned monster to attack this turn
     - Allow a monster that just attacked to attack again
-    Also flips the monster face-up if it was face-down, since face-down monsters cannot attack.
     """
     ref = _get_monster_ref_from_targets(ctx)
     if not ref:
@@ -755,10 +754,6 @@ def handle_spell_haste(
         )
     
     player_index, zone_index, card = ref
-    
-    # Flip face-up if face-down (face-down monsters cannot attack)
-    if card.get("face_down", False):
-        card["face_down"] = False
     
     # Set can_attack to True
     card["can_attack"] = True
@@ -782,68 +777,54 @@ def handle_hero_active_damage(
     """
     Hero active ability that deals damage to a target monster.
     Used for Flamecaller's 100 damage ability.
-    Always applies overflow damage to the player (like a fireball spell).
     """
     amount = int(params.get("amount") or params.get("damage", 0))
     if amount <= 0:
         return EffectResult()
     
-    # Target monster if provided; otherwise target player if supplied.
+    # Target should be a monster
     ref = _get_monster_ref_from_targets(ctx)
-    if ref:
-        # Use _apply_damage_to_monster to get proper destruction tracking and log events
-        result = _apply_damage_to_monster(ctx, amount)
-        
-        # Always apply overflow damage (hero abilities are like fireballs)
-        # Get the monster's HP before damage from the log event
-        hp_before = None
-        if result.log_events:
-            for event in result.log_events:
-                if event.get("type") == "EFFECT_DAMAGE_MONSTER":
-                    hp_before = event.get("hp_before", 0)
-                    break
-        
-        if hp_before is not None:
-            # Calculate overflow: excess damage beyond what was needed to kill the monster
-            overflow_amount = max(0, amount - hp_before)
-            
-            if overflow_amount > 0:
-                # Get the target player (the controller of the monster that was damaged)
-                target_player_index = ctx.targets.get("player")
-                if not isinstance(target_player_index, int):
-                    # If not specified, get it from the monster that was damaged
-                    if result.log_events:
-                        for event in result.log_events:
-                            if event.get("type") == "EFFECT_DAMAGE_MONSTER":
-                                target_player_index = event.get("player_index")
-                                break
-                
-                if isinstance(target_player_index, int):
-                    overflow_res = _apply_damage_to_player(
-                        ctx.game_state, target_player_index, overflow_amount
-                    )
-                    _merge_effect_results(result, overflow_res)
-                    
-                    # Update the log event to include overflow info
-                    for event in result.log_events:
-                        if event.get("type") == "EFFECT_DAMAGE_MONSTER":
-                            event["overflow_to_player"] = overflow_amount
-                            break
-        
-        return result
+    if not ref:
+        return EffectResult(
+            log_events=[
+                {
+                    "type": "EFFECT_NO_TARGET",
+                    "reason": "MONSTER_NOT_FOUND",
+                    "card_code": ctx.source_card.get("card_code"),
+                }
+            ]
+        )
     
-    # If no monster target, try player target
-    player_target = ctx.targets.get("player")
-    if isinstance(player_target, int):
-        return _apply_damage_to_player(ctx.game_state, player_target, amount)
+    player_index, zone_index, card = ref
     
-    # No valid target
+    # Deal damage
+    hp_before = card.get("hp", 0)
+    hp_after = max(0, hp_before - amount)
+    card["hp"] = hp_after
+    
+    # Calculate overflow
+    overflow = max(0, amount - hp_before) if hp_before > 0 else amount
+    
+    # Apply overflow to player
+    overflow_damage = 0
+    if overflow > 0:
+        p_state = _get_player(ctx.game_state, player_index)
+        player_hp_before = p_state.get("hp", 0)
+        player_hp_after = max(0, player_hp_before - overflow)
+        p_state["hp"] = player_hp_after
+        overflow_damage = player_hp_before - player_hp_after
+    
     return EffectResult(
         log_events=[
             {
-                "type": "EFFECT_NO_TARGET",
-                "reason": "NO_MONSTER_OR_PLAYER_TARGET",
-                "card_code": ctx.source_card.get("card_code"),
+                "type": "EFFECT_DAMAGE_MONSTER",
+                "player_index": player_index,
+                "zone_index": zone_index,
+                "amount": amount,
+                "hp_before": hp_before,
+                "hp_after": hp_after,
+                "card_instance_id": card.get("instance_id"),
+                "overflow_to_player": overflow_damage,
             }
         ]
     )
@@ -948,11 +929,10 @@ def handle_spell_counter_spell(
          original spell's effects and instead log that it was countered.
       3. If reflect_spell is True (default), the spell should be reflected back to the caster.
     """
-    # Default: only counter. Reflect only if explicitly enabled.
-    reflect_spell = params.get("reflect_spell")
-    if reflect_spell is None and "reflect" in params:
-        reflect_spell = params.get("reflect")
-    reflect_spell = bool(reflect_spell)
+    # Default to reflecting spells unless explicitly disabled
+    reflect_spell = params.get("reflect_spell", True)
+    if "reflect_spell" not in params and "reflect" in params:
+        reflect_spell = params.get("reflect", True)
     
     result = EffectResult(
         cancelled=True,
@@ -1101,8 +1081,6 @@ def handle_trap_negate_attack(
     reflect_damage = params.get("reflect_damage", True)
     damage_amount = params.get("damage_amount")
     
-    destroyed: List[Tuple[int, int]] = []
-
     if reflect_damage:
         # Default to dealing attacker's ATK as damage, or use specified amount
         damage_to_deal = int(damage_amount) if damage_amount is not None else int(attacker_atk)
@@ -1110,13 +1088,9 @@ def handle_trap_negate_attack(
         hp_before = attacker.get("hp", 0)
         hp_after = max(0, hp_before - damage_to_deal)
         attacker["hp"] = hp_after
-
-        if hp_after <= 0:
-            destroyed.append((attacker_player_index, attacker_zone_index))
         
         return EffectResult(
             cancelled=True,  # Cancel the attack
-            destroyed_monsters=destroyed,
             log_events=[
                 {
                     "type": "EFFECT_NEGATE_ATTACK",
@@ -1138,7 +1112,6 @@ def handle_trap_negate_attack(
         # Just negate, no damage
         return EffectResult(
             cancelled=True,
-            destroyed_monsters=destroyed,
             log_events=[
                 {
                     "type": "EFFECT_NEGATE_ATTACK",
